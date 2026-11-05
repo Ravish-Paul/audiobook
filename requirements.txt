@@ -1,0 +1,15 @@
+# --- Runtime --------------------------------------------------------------- #
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+python-multipart>=0.0.9      # required by FastAPI for UploadFile / File(...)
+python-dotenv>=1.0.0         # loads secrets from .env (never hardcoded)
+httpx>=0.27.0                # async HTTP client for the ElevenLabs API
+openai>=3.0.0                # Xiaomi MiMo (OpenAI-compatible endpoint)
+
+# --- Tests ----------------------------------------------------------------- #
+pytest>=8.0.0
+# httpx doubles as the TestClient transport (already pulled in above)
+#
+# FFmpeg is a system dependency (not a pip package): install it and/or set
+# FFMPEG_PATH in .env.
