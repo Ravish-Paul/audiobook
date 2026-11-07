@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.config import language_to_iso
 from app.schemas.casting import CharacterProfile, VoiceCandidate
 
 # Weighted criteria (sum == 1.0).
@@ -218,6 +219,57 @@ def _norm_token(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", " ").replace("_", " ")
 
 
+# Canonical demographic vocabularies. Free-text values from the story
+# analysis ("mature", "elderly", "old man") are folded onto the API's
+# enum values so a script word never invalidates a search filter or counts
+# as a voice mismatch. Unknown values become None (never sent, never
+# penalised) instead of silently emptying the candidate pool.
+_AGE_OLD = {"old", "older", "oldest", "elderly", "elder", "senior", "aged",
+            "veteran", "grandfather", "grandmother", "grandpa", "grandma"}
+_AGE_YOUNG = {"young", "younger", "youth", "teen", "teenage", "teenager",
+              "child", "kid", "boy", "girl"}
+_AGE_ADULT = {"mature", "adult", "grown"}
+_GENDER_FEMALE = {"female", "woman", "women", "girl", "feminine", "f", "she",
+                  "her", "hers", "mother", "mom", "sister", "daughter", "wife",
+                  "aunt", "grandmother", "grandma", "queen", "princess",
+                  "actress", "waitress", "goddess", "lady", "widow"}
+_GENDER_MALE = {"male", "man", "men", "boy", "masculine", "m", "he", "him",
+                "his", "father", "dad", "brother", "son", "uncle", "husband",
+                "grandfather", "grandpa", "king", "prince", "actor", "waiter",
+                "god", "lord", "sir", "gentleman", "widower"}
+_GENDER_NEUTRAL = {"neutral", "other", "none", "non", "binary", "androgynous"}
+
+
+def normalize_age(value: Optional[str]) -> Optional[str]:
+    """Free-text age -> 'young' | 'middle_aged' | 'old' (the API enum) | None."""
+    tokens = set(_norm_token(value).split())
+    if not tokens:
+        return None
+    if "middle" in tokens:
+        return "middle_aged"  # before 'aged' is read as old
+    if tokens & _AGE_OLD:
+        return "old"
+    if tokens & _AGE_YOUNG:
+        return "young"
+    if tokens & _AGE_ADULT:
+        return "middle_aged"
+    return None
+
+
+def normalize_gender(value: Optional[str]) -> Optional[str]:
+    """Free-text gender -> 'male' | 'female' | 'neutral' (the API enum) | None."""
+    tokens = set(_norm_token(value).split())
+    if not tokens:
+        return None
+    if tokens & _GENDER_FEMALE:
+        return "female"
+    if tokens & _GENDER_MALE:
+        return "male"
+    if tokens & _GENDER_NEUTRAL:
+        return "neutral"
+    return None
+
+
 def score_voice(
     profile: CharacterProfile,
     voice: RawVoice,
@@ -238,7 +290,7 @@ def score_voice(
 
     # --- hard exclusion: language compatibility -------------------------- #
     if required_language:
-        required = required_language.lower()
+        required = language_to_iso(required_language) or required_language.lower()
         if voice.languages and required not in voice.languages:
             return None, [f"excluded — supports {', '.join(voice.languages)}, not {required}"]
         if not voice.languages:
@@ -303,10 +355,13 @@ def score_voice(
         if not _established(getattr(profile, attribute), attribute,
                             profile.uncertain_attributes):
             continue  # unstated by the script -> neutral, never penalised
-        if not voice_value:
+        canonical = normalize_gender if attribute == "gender" else normalize_age
+        wanted = canonical(getattr(profile, attribute))
+        actual = canonical(voice_value)
+        if not wanted or not actual:
             demographic_scores.append(0.5)
             notes.append(f"{attribute} of voice unknown")
-        elif _norm_token(getattr(profile, attribute)) == _norm_token(voice_value):
+        elif wanted == actual:
             demographic_scores.append(1.0)
         else:
             demographic_scores.append(0.0)
@@ -381,9 +436,15 @@ def rank_candidates(
     required_language: Optional[str],
     required_locale: Optional[str] = None,
     limit: int = 3,
+    min_accept_score: float = MIN_ACCEPT_SCORE,
 ) -> list[VoiceCandidate]:
-    """Best `limit` candidates for `profile` — weak ones simply do not appear."""
-    language = (required_language or profile.language or "").lower() or None
+    """Best `limit` candidates for `profile` — weak ones simply do not appear.
+
+    `min_accept_score` is the progressive-relaxation knob used when a strict
+    ranking finds nothing: every speaking role must end up with a voice in
+    the story's language, but restricted voices are excluded at every level.
+    """
+    language = language_to_iso(required_language or profile.language or "") or None
     ranked: list[VoiceCandidate] = []
     seen: set[str] = set()
 
@@ -400,7 +461,7 @@ def rank_candidates(
         if scores is None:
             continue  # restricted / incompatible — never proposed
         total = total_score(scores)
-        if total < MIN_ACCEPT_SCORE:
+        if total < min_accept_score:
             continue  # too weak — do not auto-select just to fill the cast
         ranked.append(
             VoiceCandidate(

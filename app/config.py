@@ -5,6 +5,8 @@ project runs out-of-the-box without any extra setup:
 
     STORAGE_DIR=<repo>/storage/projects   (optional)
     MAX_SCRIPT_SIZE_MB=5                  (optional)
+    BETA_ACCESS_TOKENS=name:token,…       (private beta testers)
+    BETA_TESTER_GENERATION_LIMITS=name:1,… (per-tester generation limits)
 
 Secrets and ElevenLabs settings live in `<repo>/.env` (see `.env.example`).
 They are loaded once at import time; real process env vars always win, so CI
@@ -90,21 +92,137 @@ ELEVENLABS_AUDIO_EFFECT_KEYS: tuple[str, ...] = (
 ELEVENLABS_MAX_DICTIONARY_LOCATORS = 3
 ELEVENLABS_MAX_REQUEST_IDS = 3
 
-# ISO 639-1 mapping for the languages MiMo commonly reports. Only used when
-# ELEVENLABS_LANGUAGE_CODE is not set explicitly.
+# The Eleven v4 supported language vocabulary (90+ languages) — the single
+# source of truth for names MiMo may report, the upload detector shows and
+# the UI override offers. Keys are lowercase display names; values are the
+# provider's language codes (ISO 639-1 where one exists, otherwise the
+# documented ISO 639-2/3 code). A language with no code maps to "" — never
+# guess a code. Only used when ELEVENLABS_LANGUAGE_CODE is not set explicitly.
 LANGUAGE_NAME_TO_CODE: dict[str, str] = {
-    "hindi": "hi",
-    "english": "en",
-    "marathi": "mr",
+    "afrikaans": "af",
+    "amharic": "am",
+    "arabic": "ar",
+    "armenian": "hy",
+    "assamese": "as",
+    "asturian": "ast",
+    "azerbaijani": "az",
+    "belarusian": "be",
     "bengali": "bn",
+    "bosnian": "bs",
+    "bulgarian": "bg",
+    "burmese": "my",
+    "cantonese": "yue",
+    "catalan": "ca",
+    "cebuano": "ceb",
+    "croatian": "hr",
+    "czech": "cs",
+    "danish": "da",
+    "dutch": "nl",
+    "english": "en",
+    "estonian": "et",
+    "filipino": "fil",
+    "finnish": "fi",
+    "french": "fr",
+    "fula (pulaar)": "ff",
+    "galician": "gl",
+    "georgian": "ka",
+    "german": "de",
+    "greek": "el",
+    "gujarati": "gu",
+    "hausa": "ha",
+    "hebrew": "he",
+    "hindi": "hi",
+    "hungarian": "hu",
+    "icelandic": "is",
+    "indonesian": "id",
+    "italian": "it",
+    "japanese": "ja",
+    "javanese": "jv",
+    "kamba": "kam",
+    "kannada": "kn",
+    "kazakh": "kk",
+    "korean": "ko",
+    "kyrgyz": "ky",
+    "lao": "lo",
+    "latvian": "lv",
+    "lingala": "ln",
+    "lithuanian": "lt",
+    "luganda": "lg",
+    "luxembourgish": "lb",
+    "macedonian": "mk",
+    "malay": "ms",
+    "malayalam": "ml",
+    "maltese": "mt",
+    "mandarin chinese": "zh",
+    "māori": "mi",
+    "marathi": "mr",
+    "mongolian": "mn",
+    "nepali": "ne",
+    "norwegian": "no",
+    "occitan": "oc",
+    "odia": "or",
+    "pashto": "ps",
+    "persian": "fa",
+    "polish": "pl",
+    "portuguese": "pt",
+    "punjabi": "pa",
+    "romanian": "ro",
+    "russian": "ru",
+    "serbian": "sr",
+    "shona": "sn",
+    "sindhi": "sd",
+    "slovak": "sk",
+    "slovenian": "sl",
+    "somali": "so",
+    "sorani kurdish": "ckb",
+    "spanish": "es",
+    "swahili": "sw",
+    "swedish": "sv",
+    "tajik": "tg",
     "tamil": "ta",
     "telugu": "te",
-    "kannada": "kn",
-    "gujarati": "gu",
-    "punjabi": "pa",
+    "thai": "th",
+    "turkish": "tr",
+    "ukrainian": "uk",
     "urdu": "ur",
+    "uzbek": "uz",
+    "vietnamese": "vi",
+    "welsh": "cy",
+    "wolof": "wo",
+    "zulu": "zu",
+    # Unambiguous alternates MiMo or the detector may report.
+    "chinese": "zh",
+    "mandarin": "zh",
+    "maori": "mi",
+    "oriya": "or",
+    "myanmar": "my",
+    "fula": "ff",
+    "pulaar": "ff",
+    # Recognised languages outside the Eleven v4 vocabulary. The ISO code is
+    # factually correct but NO provider voice may exist — casting then finds
+    # nothing, which is the honest outcome.
+    "sinhala": "si",
     "bhojpuri": "",  # no ISO 639-1 code — never guess
 }
+
+
+def language_to_iso(value: str) -> str:
+    """Best-effort fold of a language name/code onto its provider code.
+
+    Known names map through LANGUAGE_NAME_TO_CODE; code-shaped values
+    (2-3 alpha, ISO 639-1/2/3) pass through lowercased; anything else is
+    returned untouched (never guessed) so callers can reject or display the
+    raw value loudly.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    mapped = LANGUAGE_NAME_TO_CODE.get(cleaned.lower())
+    if mapped:
+        return mapped
+    if len(cleaned) in (2, 3) and cleaned.isalpha():
+        return cleaned.lower()
+    return cleaned
 
 # Xiaomi MiMo — the AI narration director (OpenAI-compatible endpoint).
 DEFAULT_MIMO_MODEL_ID = "mimo-v2.6-flash"
@@ -116,6 +234,39 @@ DEFAULT_MIMO_MAX_ATTEMPTS = 3  # tries per analysis when the plan is invalid
 # FFmpeg audio composition.
 DEFAULT_FFMPEG_PATH = "ffmpeg"
 DEFAULT_FFMPEG_TIMEOUT_SECONDS = 600
+# ffprobe (ships with FFmpeg) reads the sample rate / duration of the
+# finished audiobook — the analysis timeline is built from the REAL values.
+DEFAULT_FFPROBE_PATH = "ffprobe"
+
+# pyannoteAI (speaker diarization + word-level transcription).
+# Docs: https://docs.pyannote.ai — billing has a 20-second minimum per
+# successful /v1/diarize job, so live submissions must stay deliberate.
+DEFAULT_PYANNOTE_BASE_URL = "https://api.pyannote.ai"
+DEFAULT_PYANNOTE_MODEL_ID = "precision-3"
+DEFAULT_PYANNOTE_TRANSCRIPTION_MODEL = "faster-whisper-large-v3-turbo"
+DEFAULT_PYANNOTE_TIMEOUT_SECONDS = 30.0
+# Controlled polling: exponential backoff between status checks.
+DEFAULT_PYANNOTE_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_PYANNOTE_POLL_MAX_INTERVAL_SECONDS = 30.0
+# Retries for IDEMPOTENT requests only (job lookup, media PUT upload).
+# A /v1/diarize submission is NEVER retried automatically — a duplicate
+# job would duplicate the charge.
+DEFAULT_PYANNOTE_MAX_ATTEMPTS = 2
+# Provider timestamps may overshoot the container duration slightly (MP3
+# padding). Anything beyond duration + tolerance is rejected as invalid.
+DEFAULT_PYANNOTE_DURATION_TOLERANCE_MS = 500
+
+# ---- Private beta limits (all env-configurable, safe defaults) ----------- #
+DEFAULT_BETA_SESSION_TTL_HOURS = 72
+DEFAULT_BETA_GENERATION_LIMIT = 10  # credit-spending calls per tester (lifetime)
+DEFAULT_BETA_GENERATION_WINDOW_HOURS = 24  # deprecated: no effect anymore
+DEFAULT_BETA_RATE_LIMIT_PER_MINUTE = 120
+DEFAULT_BETA_LOGIN_RATE_LIMIT_PER_MINUTE = 10
+DEFAULT_BETA_DUPLICATE_WINDOW_SECONDS = 10
+DEFAULT_MAX_SCRIPT_CHARACTERS = 200_000  # <= 0 disables the check
+DEFAULT_MAX_AUDIO_DURATION_MINUTES = 120  # <= 0 disables the check
+# Heuristic for the spoken duration of a plain-text script (~150 wpm).
+DEFAULT_SPEECH_CHARS_PER_MINUTE = 900
 
 # Load <repo>/.env once. `override=False` => already-exported env vars are kept.
 load_dotenv(BASE_DIR / ".env", override=False)
@@ -250,6 +401,11 @@ class Settings:
     # Hard limit for an uploaded script file.
     max_script_size_bytes: int = DEFAULT_MAX_SCRIPT_SIZE_MB * 1024 * 1024
 
+    # Hard limits for the script text itself (private-beta cost guards).
+    max_script_characters: int = DEFAULT_MAX_SCRIPT_CHARACTERS  # <= 0: unlimited
+    max_audio_duration_minutes: int = DEFAULT_MAX_AUDIO_DURATION_MINUTES
+    speech_chars_per_minute: int = DEFAULT_SPEECH_CHARS_PER_MINUTE
+
     # Only plain-text scripts are accepted for now.
     allowed_script_extensions: tuple[str, ...] = (".txt",)
 
@@ -310,14 +466,53 @@ class Settings:
     mimo_max_completion_tokens: int = DEFAULT_MIMO_MAX_COMPLETION_TOKENS
     mimo_max_attempts: int = DEFAULT_MIMO_MAX_ATTEMPTS
 
+    # ---- pyannoteAI (audio analysis: diarization + transcription) ------- #
+    pyannote_api_key: str = field(default="", repr=False)  # never print it
+    pyannote_base_url: str = DEFAULT_PYANNOTE_BASE_URL
+    pyannote_model_id: str = DEFAULT_PYANNOTE_MODEL_ID
+    pyannote_transcription_model: str = DEFAULT_PYANNOTE_TRANSCRIPTION_MODEL
+    pyannote_timeout_seconds: float = DEFAULT_PYANNOTE_TIMEOUT_SECONDS
+    pyannote_poll_interval_seconds: float = DEFAULT_PYANNOTE_POLL_INTERVAL_SECONDS
+    pyannote_poll_max_interval_seconds: float = (
+        DEFAULT_PYANNOTE_POLL_MAX_INTERVAL_SECONDS
+    )
+    pyannote_max_attempts: int = DEFAULT_PYANNOTE_MAX_ATTEMPTS
+    pyannote_duration_tolerance_ms: int = DEFAULT_PYANNOTE_DURATION_TOLERANCE_MS
+    ffprobe_path: str = DEFAULT_FFPROBE_PATH
+
     # ---- Narration plan + audio composition ------------------------------ #
     narration_plan_filename: str = "narration_plan.json"
+    narration_preferences_filename: str = "narration_preferences.json"
     character_cast_filename: str = "character_cast.json"
     multi_voice_plan_filename: str = "multi_voice_plan.json"
     segment_dir_name: str = "segments"
     audio_metadata_filename: str = "metadata.json"
     ffmpeg_path: str = DEFAULT_FFMPEG_PATH
     ffmpeg_timeout_seconds: int = DEFAULT_FFMPEG_TIMEOUT_SECONDS
+
+    # ---- Private beta access control (from .env — never hardcoded) ------- #
+    # `beta_access_tokens` maps tester name -> token. Populated from
+    # BETA_ACCESS_TOKENS="alice:token-a,bob:token-b" and/or a single
+    # BETA_ACCESS_TOKEN (tester name "tester"). Empty -> beta mode is OFF and
+    # the app behaves exactly as before (development / tests).
+    beta_access_tokens: tuple[tuple[str, str], ...] = ()
+    beta_session_secret: str = field(default="", repr=False)
+    beta_session_ttl_hours: int = DEFAULT_BETA_SESSION_TTL_HOURS
+    beta_cookie_secure: bool = False  # set true when serving over HTTPS
+    # Credit-spending calls (analyze/preview/generate/…) per tester.
+    # `beta_tester_generation_limits` overrides `beta_generation_limit` per
+    # tester identity (BETA_TESTER_GENERATION_LIMITS="name:limit,…"). Limits
+    # are non-negative integers: 0 means the tester cannot generate at all.
+    # Usage is counted persistently per tester (never reset on restart or
+    # configuration change): remaining = max(0, effective_limit - used).
+    beta_generation_limit: int = DEFAULT_BETA_GENERATION_LIMIT
+    beta_tester_generation_limits: dict[str, int] = field(default_factory=dict)
+    # Deprecated (no effect since per-tester lifetime usage replaced the
+    # windowed counter) — still parsed so old .env files keep working.
+    beta_generation_window_hours: int = DEFAULT_BETA_GENERATION_WINDOW_HOURS
+    beta_rate_limit_per_minute: int = DEFAULT_BETA_RATE_LIMIT_PER_MINUTE
+    beta_login_rate_limit_per_minute: int = DEFAULT_BETA_LOGIN_RATE_LIMIT_PER_MINUTE
+    beta_duplicate_window_seconds: int = DEFAULT_BETA_DUPLICATE_WINDOW_SECONDS
 
     @property
     def max_script_size_mb(self) -> int:
@@ -353,9 +548,39 @@ class Settings:
         return bool(self.mimo_api_key)
 
     @property
+    def pyannote_configured(self) -> bool:
+        """True when a pyannoteAI API key is available."""
+        return bool(self.pyannote_api_key)
+
+    @property
     def media_root(self) -> Path:
         """Folder exposed at `media_url_prefix` (the projects directory)."""
         return self.storage_dir
+
+    @property
+    def beta_enabled(self) -> bool:
+        """True when at least one beta tester token is configured."""
+        return bool(self.beta_access_tokens)
+
+    @property
+    def beta_tokens_by_value(self) -> dict[str, str]:
+        """Reverse lookup: token -> tester name (tokens are compared safely)."""
+        return {token: name for name, token in self.beta_access_tokens}
+
+    @property
+    def beta_session_key(self) -> bytes:
+        """Key for HMAC-signing session cookies.
+
+        An explicit BETA_SESSION_SECRET wins; otherwise the key is derived
+        from the configured tokens, so nothing is ever hardcoded and
+        rotating tokens invalidates existing sessions.
+        """
+        import hashlib
+
+        if self.beta_session_secret:
+            return self.beta_session_secret.encode("utf-8")
+        material = "|".join(f"{n}:{t}" for n, t in self.beta_access_tokens)
+        return hashlib.sha256(f"beta-session:{material}".encode("utf-8")).digest()
 
     def media_url(self, path: Path) -> str:
         """Public, browser-playable URL for a file stored under `media_root`."""
@@ -363,10 +588,131 @@ class Settings:
         return f"{self.media_url_prefix}/{relative.as_posix()}"
 
 
+def parse_beta_tokens(raw: str, single: str) -> tuple[tuple[str, str], ...]:
+    """Parse `BETA_ACCESS_TOKENS="name:token,name2:token2"` (+ BETA_ACCESS_TOKEN).
+
+    Returns an ordered tuple of (tester_name, token) pairs. A single
+    BETA_ACCESS_TOKEN is registered under the name "tester". Malformed
+    chunks are ignored — never guess.
+    """
+    pairs: list[tuple[str, str]] = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        name, token = chunk.split(":", 1)
+        name, token = name.strip(), token.strip()
+        valid_name = (
+            1 <= len(name) <= 32
+            and all(ch.isalnum() or ch in "-_" for ch in name)
+        )
+        if valid_name and token:
+            pairs.append((name, token))
+    if (single or "").strip():
+        pairs.append(("tester", single.strip()))
+    # Later definitions win for duplicated names.
+    return tuple({name: token for name, token in pairs}.items())
+
+
+def _is_non_negative_int(value: str) -> bool:
+    """True for plain ASCII integer literals like "0", "7" (no sign/decimal)."""
+    return bool(value) and value.isascii() and value.isdigit()
+
+
+def parse_generation_limit(raw: str, variable: str) -> int:
+    """Parse a generation limit variable: a non-negative integer (0 = none).
+
+    Negative values and decimals are rejected loudly at startup instead of
+    being silently reinterpreted.
+    """
+    value = (raw or "").strip()
+    if _is_non_negative_int(value):
+        return int(value)
+    if value.startswith("-") and _is_non_negative_int(value[1:]):
+        raise ValueError(
+            f"{variable}: negative generation limit ({value}) — limits must be "
+            "non-negative integers (use 0 to block generation entirely)"
+        )
+    raise ValueError(
+        f"{variable}: invalid generation limit ({value!r}) — limits must be "
+        "non-negative integers (no decimals)"
+    )
+
+
+def parse_tester_generation_limits(
+    raw: str, known_testers: Any
+) -> dict[str, int]:
+    """Parse `BETA_TESTER_GENERATION_LIMITS="name:1,name2:3"`.
+
+    Every entry must name an identity configured in `BETA_ACCESS_TOKENS` and
+    carry a non-negative integer limit (0 = the tester cannot generate).
+    Malformed entries, duplicate names, unknown identities, negative values
+    and decimal values raise `ValueError` at startup — never guess, never
+    silently ignore an entry. Error messages identify testers by name but
+    never include authentication tokens.
+    """
+    limits: dict[str, int] = {}
+    known = set(known_testers)
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or chunk.count(":") != 1:
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: malformed entry "
+                f"{chunk!r} (expected 'tester:limit')"
+            )
+        name, value = (part.strip() for part in chunk.split(":", 1))
+        if not name or not value:
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: malformed entry "
+                f"{chunk!r} (expected 'tester:limit')"
+            )
+        if name in limits:
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: duplicate tester name "
+                f"'{name}'"
+            )
+        if name not in known:
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: unknown tester '{name}' — "
+                "every entry must name an identity configured in "
+                "BETA_ACCESS_TOKENS".format(name=name)
+            )
+        if value.startswith("-") and _is_non_negative_int(value[1:]):
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: negative limit "
+                f"({value}) for tester '{name}' — limits must be "
+                "non-negative integers (use 0 to block generation)"
+            )
+        if not _is_non_negative_int(value):
+            raise ValueError(
+                "BETA_TESTER_GENERATION_LIMITS: invalid limit "
+                f"({value!r}) for tester '{name}' — limits must be "
+                "non-negative integers (no decimals)"
+            )
+        limits[name] = int(value)
+    return limits
+
+
 def get_settings() -> Settings:
-    """Build settings from the current environment (cheap, safe to call often)."""
+    """Build settings from the current environment (cheap, safe to call often).
+
+    Beta configuration is validated here — so a malformed
+    `BETA_TESTER_GENERATION_LIMITS` / `BETA_GENERATION_LIMIT` fails
+    application startup with a clear error instead of being ignored.
+    """
     storage_dir = Path(_env("STORAGE_DIR", str(DEFAULT_STORAGE_DIR))).expanduser()
     max_mb = int(_env("MAX_SCRIPT_SIZE_MB", str(DEFAULT_MAX_SCRIPT_SIZE_MB)))
+    beta_access_tokens = parse_beta_tokens(
+        _env("BETA_ACCESS_TOKENS", ""), _secret("BETA_ACCESS_TOKEN")
+    )
+    # Per-tester generation limits must name configured tester identities.
+    beta_tester_generation_limits = parse_tester_generation_limits(
+        _env("BETA_TESTER_GENERATION_LIMITS", ""),
+        [name for name, _ in beta_access_tokens],
+    )
 
     return Settings(
         storage_dir=storage_dir,
@@ -428,9 +774,103 @@ def get_settings() -> Settings:
         mimo_max_attempts=max(
             1, int(_env("MIMO_MAX_ATTEMPTS", str(DEFAULT_MIMO_MAX_ATTEMPTS)))
         ),
+        # pyannoteAI (audio analysis)
+        pyannote_api_key=_secret("PYANNOTE_API_KEY"),
+        pyannote_base_url=_env(
+            "PYANNOTE_BASE_URL", DEFAULT_PYANNOTE_BASE_URL
+        ).rstrip("/"),
+        pyannote_model_id=_env("PYANNOTE_MODEL_ID", DEFAULT_PYANNOTE_MODEL_ID),
+        pyannote_transcription_model=_env(
+            "PYANNOTE_TRANSCRIPTION_MODEL", DEFAULT_PYANNOTE_TRANSCRIPTION_MODEL
+        ),
+        pyannote_timeout_seconds=float(
+            _env("PYANNOTE_TIMEOUT_SECONDS", str(DEFAULT_PYANNOTE_TIMEOUT_SECONDS))
+        ),
+        pyannote_poll_interval_seconds=max(
+            0.0,
+            float(
+                _env(
+                    "PYANNOTE_POLL_INTERVAL_SECONDS",
+                    str(DEFAULT_PYANNOTE_POLL_INTERVAL_SECONDS),
+                )
+            ),
+        ),
+        pyannote_poll_max_interval_seconds=max(
+            0.0,
+            float(
+                _env(
+                    "PYANNOTE_POLL_MAX_INTERVAL_SECONDS",
+                    str(DEFAULT_PYANNOTE_POLL_MAX_INTERVAL_SECONDS),
+                )
+            ),
+        ),
+        pyannote_max_attempts=max(
+            1, int(_env("PYANNOTE_MAX_ATTEMPTS", str(DEFAULT_PYANNOTE_MAX_ATTEMPTS)))
+        ),
+        pyannote_duration_tolerance_ms=max(
+            0,
+            int(
+                _env(
+                    "PYANNOTE_DURATION_TOLERANCE_MS",
+                    str(DEFAULT_PYANNOTE_DURATION_TOLERANCE_MS),
+                )
+            ),
+        ),
         # FFmpeg
         ffmpeg_path=_env("FFMPEG_PATH", DEFAULT_FFMPEG_PATH),
         ffmpeg_timeout_seconds=int(
             _env("FFMPEG_TIMEOUT_SECONDS", str(DEFAULT_FFMPEG_TIMEOUT_SECONDS))
+        ),
+        ffprobe_path=_env("FFPROBE_PATH", DEFAULT_FFPROBE_PATH),
+        # Private-beta limits + access control
+        max_script_characters=int(
+            _env("MAX_SCRIPT_CHARACTERS", str(DEFAULT_MAX_SCRIPT_CHARACTERS))
+        ),
+        max_audio_duration_minutes=int(
+            _env(
+                "MAX_AUDIO_DURATION_MINUTES",
+                str(DEFAULT_MAX_AUDIO_DURATION_MINUTES),
+            )
+        ),
+        speech_chars_per_minute=max(
+            1,
+            int(
+                _env("SPEECH_CHARS_PER_MINUTE", str(DEFAULT_SPEECH_CHARS_PER_MINUTE))
+            ),
+        ),
+        beta_access_tokens=beta_access_tokens,
+        beta_tester_generation_limits=beta_tester_generation_limits,
+        beta_session_secret=_secret("BETA_SESSION_SECRET"),
+        beta_session_ttl_hours=int(
+            _env("BETA_SESSION_TTL_HOURS", str(DEFAULT_BETA_SESSION_TTL_HOURS))
+        ),
+        beta_cookie_secure=_bool_env("BETA_COOKIE_SECURE", False),
+        beta_generation_limit=parse_generation_limit(
+            _env("BETA_GENERATION_LIMIT", str(DEFAULT_BETA_GENERATION_LIMIT)),
+            "BETA_GENERATION_LIMIT",
+        ),
+        beta_generation_window_hours=int(
+            _env(
+                "BETA_GENERATION_WINDOW_HOURS",
+                str(DEFAULT_BETA_GENERATION_WINDOW_HOURS),
+            )
+        ),
+        beta_rate_limit_per_minute=int(
+            _env(
+                "BETA_RATE_LIMIT_PER_MINUTE",
+                str(DEFAULT_BETA_RATE_LIMIT_PER_MINUTE),
+            )
+        ),
+        beta_login_rate_limit_per_minute=int(
+            _env(
+                "BETA_LOGIN_RATE_LIMIT_PER_MINUTE",
+                str(DEFAULT_BETA_LOGIN_RATE_LIMIT_PER_MINUTE),
+            )
+        ),
+        beta_duplicate_window_seconds=int(
+            _env(
+                "BETA_DUPLICATE_WINDOW_SECONDS",
+                str(DEFAULT_BETA_DUPLICATE_WINDOW_SECONDS),
+            )
         ),
     )

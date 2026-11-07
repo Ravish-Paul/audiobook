@@ -31,7 +31,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from app.config import LANGUAGE_NAME_TO_CODE, Settings, get_settings
+from app import plan_identity
+from app.config import Settings, get_settings, language_to_iso
+from app.security import current_generation_id
+from app.services.script_limits import check_script_limits
 from app.schemas.audio import AudioResponse
 from app.schemas.multi_voice import MultiVoicePlan, Utterance
 from app.schemas.narration import NarrationPlan, ParagraphPlan
@@ -48,6 +51,7 @@ from app.services.errors import (
     SegmentGenerationError,
     StaleMultiVoicePlanError,
     StaleNarrationPlanError,
+    StaleNarrationPreferencesError,
     UtteranceGenerationError,
     VoiceNotAssignedError,
 )
@@ -68,10 +72,18 @@ def _utcnow() -> datetime:
 
 
 def plan_hash(plan: Any) -> str:
-    """Stable fingerprint of a plan model — lets us reuse finished segments."""
-    payload = json.dumps(
-        plan.model_dump(mode="json"), sort_keys=True, ensure_ascii=False
-    )
+    """Stable fingerprint of a plan model — lets us reuse finished segments.
+
+    Narration preferences are PART of the hash: changing them changes the
+    fingerprint, so segments produced under the old preferences are never
+    reused. Plans created before preferences existed carry `preferences: None`
+    and keep their previous fingerprint (otherwise every existing project
+    would silently re-bill its finished segments after this upgrade).
+    """
+    data = plan.model_dump(mode="json")
+    if isinstance(data, dict) and data.get("preferences") is None:
+        data.pop("preferences", None)
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -131,11 +143,33 @@ class AudioService:
         # 2) stored script: 404 when missing, 400 when empty
         text = self.projects.read_script(project_id)
 
+        # 2b) private-beta length / estimated-duration limits (cost guard)
+        check_script_limits(self.settings, text)
+
         # 3) multi-voice mode when an utterance plan exists (spec §8) …
         multi_voice = self.projects.get_multi_voice_plan(project_id)
         if multi_voice is not None:
             mv_plan, _ = multi_voice
-            return await self._generate_multi_voice(project_id, text, mv_plan)
+            # Plan workflow lifecycle (durable recovery): started -> completed
+            # / failed, keyed by the middleware's generation_id (joined when
+            # the workflow was already paid for, fresh otherwise). The
+            # allowance is never refunded on failure (existing policy).
+            plan_identity.mark_started(
+                self.settings, project_id, current_generation_id()
+            )
+            try:
+                response = await self._generate_multi_voice(
+                    project_id, text, mv_plan
+                )
+            except Exception:
+                plan_identity.mark_failed(
+                    self.settings, project_id, current_generation_id()
+                )
+                raise
+            plan_identity.mark_completed(
+                self.settings, project_id, current_generation_id()
+            )
+            return response
 
         # 4) … else paragraph-plan mode when analysis ran, else legacy single pass
         stored = self.projects.get_narration_plan(project_id)
@@ -182,6 +216,7 @@ class AudioService:
             "generated_at": _utcnow().isoformat(),
             "mode": MODE_SINGLE_PASS,
             "segment_count": None,
+            "generation_id": current_generation_id(),
         }
         self.projects.save_audio_metadata(project_id, info)
 
@@ -201,6 +236,16 @@ class AudioService:
         problems = validate_against_script(plan, paragraphs)
         if problems:
             raise StaleNarrationPlanError(project_id, problems)
+
+        # …and it must have been built with the preferences currently stored
+        # for the project: changing preferences triggers a NEW plan (the plan
+        # hash changes with them, so old segments must not be reused).
+        stored_preferences = self.projects.get_narration_preferences(project_id)
+        current_preferences = (
+            stored_preferences[0] if stored_preferences else None
+        )
+        if plan.preferences != current_preferences:
+            raise StaleNarrationPreferencesError(project_id)
 
         ordered = sorted(plan.paragraphs, key=lambda p: p.paragraph_index)
         max_chars = self.settings.elevenlabs_max_chars
@@ -289,6 +334,7 @@ class AudioService:
             "generated_at": _utcnow().isoformat(),
             "mode": MODE_NARRATION_PLAN,
             "segment_count": len(records),
+            "generation_id": current_generation_id(),
         }
         self.projects.save_audio_metadata(project_id, info)
         self._update_metadata(
@@ -427,8 +473,12 @@ class AudioService:
         configured = (self.settings.elevenlabs_language_code or "").strip()
         if configured:
             return configured.lower()
-        code = LANGUAGE_NAME_TO_CODE.get(plan.language.strip().lower(), "")
-        return code or None
+        code = language_to_iso(plan.language)
+        # Only a real ISO-looking code is ever sent — an unrecognised raw
+        # name stays a display value and never becomes an API parameter.
+        if len(code) in (2, 3) and code.isalpha():
+            return code
+        return None
 
     @staticmethod
     def _cast_language_code(cast) -> Optional[str]:
@@ -569,6 +619,7 @@ class AudioService:
             "generated_at": _utcnow().isoformat(),
             "mode": MODE_MULTI_VOICE,
             "segment_count": len(records),
+            "generation_id": current_generation_id(),
         }
         self.projects.save_audio_metadata(project_id, info)
         self._update_metadata(

@@ -182,19 +182,29 @@ class NarrationPlanError(ProjectError):
     """MiMo returned a plan that failed validation after all retries.
 
     The response never generates audio; `problems` explains exactly what was
-    wrong with the model output.
+    wrong with the model output and `raw_responses` preserves the original
+    raw MiMo outputs for debugging (also written to `mimo_debug/`).
     """
 
     status_code = 502
 
-    def __init__(self, problems: list[str], attempts: int) -> None:
+    def __init__(
+        self,
+        problems: list[str],
+        attempts: int,
+        raw_responses: list[str] | None = None,
+        normalization_notes: list[str] | None = None,
+    ) -> None:
         self.problems = problems
         self.attempts = attempts
+        self.raw_responses = list(raw_responses or [])
+        self.normalization_notes = list(normalization_notes or [])
         preview = " | ".join(problems[:6])
         more = "" if len(problems) <= 6 else f" (+{len(problems) - 6} more)"
         super().__init__(
-            f"MiMo returned an invalid narration plan after {attempts} "
-            f"attempt(s); no audio was generated. Problems: {preview}{more}"
+            "Unable to prepare the narration plan. Please try again — no audio "
+            f"was generated. (MiMo returned an invalid narration plan after "
+            f"{attempts} attempt(s). Problems: {preview}{more})"
         )
 
 
@@ -221,6 +231,13 @@ class FFmpegCompositionError(FFmpegError):
         super().__init__(f"FFmpeg could not assemble the audiobook: {message}")
 
 
+class AudioProbeError(FFmpegError):
+    """ffprobe/ffmpeg could not read the sample rate or duration."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"audio probing failed: {message}")
+
+
 class StaleNarrationPlanError(ProjectError):
     """The script changed after the plan was analysed (or vice versa)."""
 
@@ -234,6 +251,44 @@ class StaleNarrationPlanError(ProjectError):
             f"The narration plan for project '{project_id}' no longer matches "
             f"the uploaded script ({preview}). Re-run "
             f"POST /projects/{project_id}/analyze-narration"
+        )
+
+
+class StaleNarrationPreferencesError(ProjectError):
+    """The narration preferences changed after this plan was generated."""
+
+    status_code = 409
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+        super().__init__(
+            f"The narration preferences of project '{project_id}' changed after "
+            "this narration plan was generated. Re-run "
+            f"POST /projects/{project_id}/analyze-narration so the plan is "
+            "rebuilt under the new preferences (the plan hash changed, so old "
+            "segments must not be reused)."
+        )
+
+
+class InvalidNarrationPreferencesError(ProjectError):
+    """Preferences that cannot apply to this project's script."""
+
+    status_code = 400
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Invalid narration preferences: {message}")
+
+
+class ParagraphPreviewError(ProjectError):
+    """The preview requested a paragraph that the script does not contain."""
+
+    status_code = 400
+
+    def __init__(self, paragraph_index: int, paragraph_count: int) -> None:
+        self.paragraph_index = paragraph_index
+        super().__init__(
+            f"paragraph_index {paragraph_index} is outside this script "
+            f"(0..{paragraph_count - 1})"
         )
 
 
@@ -386,4 +441,94 @@ class UtteranceGenerationError(ProjectError):
             f"Utterance {failed_id} failed after {completed}/{total} utterance(s) "
             f"were generated; completed utterances were preserved. "
             f"Reason: {reason}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# pyannoteAI (audio analysis: diarization + word-level transcription)
+# --------------------------------------------------------------------------- #
+class PyannoteError(ProjectError):
+    """Base class for pyannoteAI integration errors."""
+
+
+class PyannoteConfigError(PyannoteError):
+    """Missing PYANNOTE_API_KEY (server misconfiguration)."""
+
+    status_code = 500
+
+
+class PyannoteAuthError(PyannoteError):
+    """pyannoteAI rejected the API key (401/403)."""
+
+    status_code = 401
+
+
+class PyannoteRequestError(PyannoteError):
+    """pyannoteAI rejected our request payload (400/422)."""
+
+    status_code = 400
+
+
+class PyannoteRateLimitError(PyannoteError):
+    """pyannoteAI rate limit reached (429)."""
+
+    status_code = 429
+
+
+class PyannoteTimeoutError(PyannoteError):
+    """No response from pyannoteAI within the configured timeout."""
+
+    status_code = 504
+
+
+class PyannoteAPIError(PyannoteError):
+    """Any other pyannoteAI failure / network problem -> bad gateway."""
+
+    status_code = 502
+
+
+class AudioAnalysisNotFoundError(ProjectError):
+    """No audio analysis exists yet for this project."""
+
+    status_code = 404
+
+    def __init__(self, project_id: str, reason: str = "not started yet") -> None:
+        self.project_id = project_id
+        super().__init__(
+            f"No audio analysis available for project '{project_id}' ({reason})"
+        )
+
+
+class AudioAnalysisIncompleteError(ProjectError):
+    """The analysis exists but has not completed successfully yet."""
+
+    status_code = 409
+
+    def __init__(self, project_id: str, status: str, error: str = "") -> None:
+        self.project_id = project_id
+        self.status = status
+        detail = f" (last error: {error})" if error else ""
+        super().__init__(
+            f"The audio analysis for project '{project_id}' is '{status}' — "
+            f"the normalized result is not available yet{detail}. Check "
+            "GET /projects/{project_id}/audio-analysis/status first"
+        )
+
+
+class AudioAnalysisNormalizationError(ProjectError):
+    """pyannoteAI succeeded but its output could not be normalized.
+
+    The raw provider response is always preserved on disk first, so the
+    failure can be debugged without re-running (and re-paying for) the job.
+    """
+
+    status_code = 502
+
+    def __init__(self, problems: list[str]) -> None:
+        self.problems = problems
+        preview = " | ".join(problems[:6])
+        more = "" if len(problems) <= 6 else f" (+{len(problems) - 6} more)"
+        super().__init__(
+            "The pyannoteAI output could not be normalized into the internal "
+            f"audio timeline. Problems: {preview}{more}"
         )

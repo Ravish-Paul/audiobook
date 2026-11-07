@@ -1,10 +1,17 @@
 """Service layer: business logic and local storage access."""
 
+from app.services.audio_analysis_normalizer import (
+    normalize_analysis_output,
+    seconds_to_ms,
+    seconds_to_samples,
+)
+from app.services.audio_analysis_service import AudioAnalysisService
 from app.services.audio_composer import (
     FFmpegAudioComposer,
     Segment,
     resolve_ffmpeg,
 )
+from app.services.audio_probe import AudioProbe, probe_audio, resolve_ffprobe
 from app.services.audio_service import AudioService
 from app.services.audio_tags import (
     find_tags,
@@ -22,7 +29,11 @@ from app.services.elevenlabs_client import (
     SynthesisResult,
 )
 from app.services.errors import (
+    AudioAnalysisIncompleteError,
+    AudioAnalysisNormalizationError,
+    AudioAnalysisNotFoundError,
     AudioNotFoundError,
+    AudioProbeError,
     AudioSaveError,
     CastingNotApprovedError,
     CharacterAnalysisError,
@@ -38,6 +49,7 @@ from app.services.errors import (
     FFmpegCompositionError,
     FFmpegError,
     FFmpegNotFoundError,
+    InvalidNarrationPreferencesError,
     MiMoAPIError,
     MiMoAuthError,
     MiMoConfigError,
@@ -48,8 +60,16 @@ from app.services.errors import (
     MultiVoicePlanNotFoundError,
     NarrationPlanError,
     NarrationPlanNotFoundError,
+    ParagraphPreviewError,
     ProjectError,
     ProjectNotFoundError,
+    PyannoteAPIError,
+    PyannoteAuthError,
+    PyannoteConfigError,
+    PyannoteError,
+    PyannoteRateLimitError,
+    PyannoteRequestError,
+    PyannoteTimeoutError,
     ScriptNotFoundError,
     ScriptTooLargeError,
     ScriptTooLongError,
@@ -57,6 +77,7 @@ from app.services.errors import (
     SegmentGenerationError,
     StaleMultiVoicePlanError,
     StaleNarrationPlanError,
+    StaleNarrationPreferencesError,
     UtteranceGenerationError,
     VoiceNotAssignedError,
     VoiceSelectionError,
@@ -73,7 +94,9 @@ from app.services.narration_planner import (
     split_paragraphs,
     validate_against_script,
 )
+from app.services.narration_policy import NarrationPolicyValidator
 from app.services.project_service import ProjectService
+from app.services.pyannote_client import PyannoteClient
 from app.services.voice_casting_service import VoiceCastingService
 from app.services.voice_discovery import (
     ElevenLabsVoiceDiscovery,
@@ -87,7 +110,13 @@ from app.services.voice_matcher import (
 )
 
 __all__ = [
+    "AudioAnalysisIncompleteError",
+    "AudioAnalysisNormalizationError",
+    "AudioAnalysisNotFoundError",
+    "AudioAnalysisService",
     "AudioNotFoundError",
+    "AudioProbe",
+    "AudioProbeError",
     "AudioSaveError",
     "AudioService",
     "CastingNotApprovedError",
@@ -108,6 +137,7 @@ __all__ = [
     "FFmpegCompositionError",
     "FFmpegError",
     "FFmpegNotFoundError",
+    "InvalidNarrationPreferencesError",
     "MiMoAPIError",
     "MiMoAuthError",
     "MiMoClient",
@@ -122,9 +152,19 @@ __all__ = [
     "NarrationPlanError",
     "NarrationPlanNotFoundError",
     "NarrationPlanner",
+    "NarrationPolicyValidator",
+    "ParagraphPreviewError",
     "ProjectError",
     "ProjectNotFoundError",
     "ProjectService",
+    "PyannoteAPIError",
+    "PyannoteAuthError",
+    "PyannoteClient",
+    "PyannoteConfigError",
+    "PyannoteError",
+    "PyannoteRateLimitError",
+    "PyannoteRequestError",
+    "PyannoteTimeoutError",
     "ScriptNotFoundError",
     "ScriptTooLargeError",
     "ScriptTooLongError",
@@ -133,6 +173,7 @@ __all__ = [
     "SegmentGenerationError",
     "StaleMultiVoicePlanError",
     "StaleNarrationPlanError",
+    "StaleNarrationPreferencesError",
     "SynthesisContext",
     "SynthesisResult",
     "UtteranceGenerationError",
@@ -145,10 +186,15 @@ __all__ = [
     "get_capabilities",
     "known_model_ids",
     "normalize_account_voice",
+    "normalize_analysis_output",
     "normalize_shared_voice",
+    "probe_audio",
     "rank_candidates",
     "require_tts_text",
     "resolve_ffmpeg",
+    "resolve_ffprobe",
+    "seconds_to_ms",
+    "seconds_to_samples",
     "split_paragraphs",
     "strip_tags",
     "validate_against_script",

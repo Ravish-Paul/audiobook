@@ -318,7 +318,10 @@ class ElevenLabsVoiceDiscovery:
         try:
             return await self._get(f"{self._v1_base}/voices/{voice_id}", {})
         except ElevenLabsAPIError as exc:
-            if "not found (404)" in str(exc):
+            # The API answers 404 — and sometimes 400 "not found" — for a
+            # voice that is not in this account (e.g. a library voice that
+            # was never imported). Both mean the same to the caller.
+            if "not found" in str(exc).lower():
                 raise VoiceDetailsNotFoundError(
                     f"voice '{voice_id}' is not available in this account"
                 ) from exc

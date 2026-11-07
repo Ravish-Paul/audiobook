@@ -81,3 +81,40 @@ class UploadScriptResponse(BaseModel):
     size_bytes: int
     stored_path: str
     uploaded_at: datetime
+
+
+class ScriptImportResponse(BaseModel):
+    """`POST /projects/from-script` — auto-created project + stored script.
+
+    Everything the simple creator UI needs after an upload: the detected
+    title and language, paragraph count and a short preview. `project_id`
+    stays in the API for clients but is never shown to end users.
+    """
+
+    project_id: str
+    title: str = Field(
+        description="Detected book title (explicit heading, else the filename)."
+    )
+    language: str = Field(
+        description="Detected script language (refined by the narration plan)."
+    )
+    language_code: Optional[str] = Field(
+        default=None, description="ISO 639-1 code when known."
+    )
+    paragraph_count: int
+    filename: str
+    size_bytes: int
+    character_count: int
+    script_preview: str = Field(description="Short plain-text preview of the script.")
+    upload_status: str = Field(
+        description="'success' when the script was stored on disk."
+    )
+    uploaded_at: datetime
+
+
+class DeleteResponse(BaseModel):
+    """DELETE /projects and DELETE /projects/{project_id} (privacy tools)."""
+
+    deleted: bool = True
+    project_id: Optional[str] = None
+    deleted_count: int = 0

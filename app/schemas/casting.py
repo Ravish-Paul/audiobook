@@ -268,6 +268,14 @@ class VoiceCastingResponse(BaseModel):
     characters: dict[str, SpeakerCasting]
     missing_speakers: list[str] = Field(default_factory=list)
     saved_at: Optional[datetime] = None
+    story: Optional[StoryAnalysis] = Field(
+        default=None,
+        description=(
+            "The stored story analysis (character identities/descriptions) — "
+            "additive restore field so a reloaded browser can rebuild the "
+            "casting UI without re-running character analysis."
+        ),
+    )
 
 
 class SelectVoiceRequest(BaseModel):

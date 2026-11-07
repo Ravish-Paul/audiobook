@@ -19,8 +19,9 @@ present and falls back to the paragraph plan / single pass otherwise.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Request, Response
 
+from app import plan_identity
 from app.config import get_settings
 from app.schemas.casting import (
     AuditionRequest,
@@ -28,7 +29,8 @@ from app.schemas.casting import (
     SelectVoiceRequest,
     VoiceCastingResponse,
 )
-from app.schemas.multi_voice import MultiVoicePlanResponse
+from app.schemas.multi_voice import MultiVoicePlanResponse, MultiVoicePlanStatusResponse
+from app.security import current_tester, mv_plan_joined
 from app.services.character_analyzer import CharacterAnalyzer
 from app.services.multi_voice_planner import MultiVoicePlanner
 from app.services.voice_casting_service import VoiceCastingService
@@ -167,5 +169,37 @@ def create_multi_voice_plan(project_id: str) -> MultiVoicePlanResponse:
     Narration and dialogue stay distinct; every utterance's words reproduce
     the original paragraph exactly; locked voice ids are stamped by the
     system (MiMo never assigns voices). Saves `multi_voice_plan.json`.
+
+    Durable recovery (Case A/B): when the server's stored script, cast and
+    narration preferences are unchanged and a plan workflow is already paid
+    for, this request JOINS it (`mv_plan_joined`) and returns the saved
+    plan — no second allowance, no second MiMo call, regardless of what the
+    browser did with its localStorage.
     """
-    return _planner().create(project_id)
+    return _planner().create(project_id, joined=mv_plan_joined())
+
+
+@router.get(
+    "/{project_id}/multi-voice-plan/status",
+    response_model=MultiVoicePlanStatusResponse,
+    summary="Status of the project's multi-voice plan (never charged)",
+    response_description=(
+        "Plan existence, lifecycle status, validity and readiness for generation"
+    ),
+)
+def multi_voice_plan_status(
+    project_id: str, tester: str = Depends(current_tester)
+) -> MultiVoicePlanStatusResponse:
+    """Server-authoritative plan status — the browser's recovery source.
+
+    Everything is computed from the stored project data (script, character
+    cast, narration preferences) and the persisted plan record; the request
+    contributes no hashes or identities. Never reserves or consumes an
+    allowance, and never exposes another tester's plan (the project
+    ownership check runs before this handler and the record owner is
+    re-verified here).
+    """
+    status = plan_identity.plan_status(
+        get_settings(), project_id, owner=tester
+    )
+    return MultiVoicePlanStatusResponse(**status)

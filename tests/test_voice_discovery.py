@@ -23,9 +23,12 @@ from app.services.voice_discovery import (
     VoiceDetailsNotFoundError,
     VoiceSearchFilters,
 )
+from app.config import language_to_iso
 from app.services.voice_matcher import (
     MIN_ACCEPT_SCORE,
     normalize_account_voice,
+    normalize_age,
+    normalize_gender,
     normalize_shared_voice,
     rank_candidates,
     score_voice,
@@ -351,6 +354,22 @@ def test_get_voice_not_found_raises_typed_error() -> None:
         asyncio.run(discovery.get_voice("missing-voice"))
 
 
+def test_get_voice_400_not_found_also_raises_typed_error() -> None:
+    """The API sometimes answers 400 "not found" instead of 404 (live bug:
+    an un-imported library voice surfaced as an opaque 502)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"detail": "A voice with ID 'ghost' was not found."},
+            request=request,
+        )
+
+    discovery = _discovery(handler)  # type: ignore[arg-type]
+    with pytest.raises(VoiceDetailsNotFoundError):
+        asyncio.run(discovery.get_voice("ghost"))
+
+
 def test_add_shared_voice_posts_to_official_path() -> None:
     mock = DiscoveryMock()
     discovery = _discovery(mock)
@@ -561,3 +580,62 @@ def test_locale_match_scores_higher_than_other_region() -> None:
     assert exact_scores and other_scores
     assert total_score(exact_scores) > total_score(other_scores)
     assert any("locale differs" in n for n in other_notes)
+
+
+def test_demographic_alias_normalization() -> None:
+    """Free-text demographics fold onto the provider's enum vocabulary."""
+    assert normalize_age("mature") == "middle_aged"
+    assert normalize_age("middle aged") == "middle_aged"
+    assert normalize_age("elderly") == "old"
+    assert normalize_age("old man") == "old"
+    assert normalize_age("Young") == "young"
+    assert normalize_age("strange") is None
+    assert normalize_age(None) is None
+
+    assert normalize_gender("male") == "male"
+    assert normalize_gender("Old Man") == "male"
+    assert normalize_gender("female") == "female"
+    assert normalize_gender("woman") == "female"
+    assert normalize_gender("xy") is None
+    assert normalize_gender(None) is None
+
+
+def test_language_names_fold_to_iso_for_matching() -> None:
+    """Story language as a NAME still matches ISO-coded voices.
+
+    Extended-language gap: 'Japanese' must fold to 'ja' so the hard language
+    rule matches ja-capable voices instead of excluding every voice.
+    """
+    assert language_to_iso("Japanese") == "ja"
+    assert language_to_iso("Korean") == "ko"
+    assert language_to_iso("Arabic") == "ar"
+    assert language_to_iso("Indonesian") == "id"
+    assert language_to_iso("Italian") == "it"
+    assert language_to_iso("Portuguese") == "pt"
+    assert language_to_iso("Turkish") == "tr"
+    assert language_to_iso("hi") == "hi"  # codes pass through
+    assert language_to_iso("Bhojpuri") == "Bhojpuri"  # never guessed
+
+    ja_voice = normalize_account_voice(account_voice("v-ja", languages=("ja",)))
+    en_voice = normalize_account_voice(account_voice("v-en", languages=("en",)))
+    assert ja_voice and en_voice
+
+    scores, notes = score_voice(
+        _profile(language="Japanese"), ja_voice, required_language="Japanese"
+    )
+    assert scores is not None, notes  # the NAME folds -> ja matches ja
+
+    excluded, notes = score_voice(
+        _profile(language="Japanese"), en_voice, required_language="Japanese"
+    )
+    assert excluded is None  # the hard rule still excludes wrong languages
+    assert any("not ja" in n for n in notes)
+
+    ranked = rank_candidates(
+        _profile(language="Japanese"),
+        [ja_voice, en_voice],
+        required_language="Japanese",
+        min_accept_score=0.0,
+        limit=3,
+    )
+    assert [c.voice_id for c in ranked] == ["v-ja"]

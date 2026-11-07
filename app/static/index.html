@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Create your audiobook</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="page-header">
+    <h1>Create your audiobook</h1>
+    <p class="subtitle">Turn your script into a professionally narrated audiobook.</p>
+  </header>
+
+  <main class="page">
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+
+    <!-- ─────────────────────────── 1 · Script ─────────────────────────── -->
+    <section class="card" aria-labelledby="upload-heading">
+      <h2 id="upload-heading"><span class="step-badge" aria-hidden="true">1</span> Your script</h2>
+
+      <div id="drop-zone" class="drop-zone" tabindex="0" role="button"
+           aria-label="Upload your script. Drag and drop a .txt file here, or press Enter to choose a file.">
+        <svg class="drop-icon" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+          <path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm0 2.5L17.5 8H14V4.5zM8 13h8v1.6H8V13zm0 3.4h8V18H8v-1.6z"/>
+        </svg>
+        <p class="drop-title">Drag &amp; drop your script here</p>
+        <p class="drop-sub">.txt &middot; UTF-8 &middot; up to 5 MB</p>
+        <button id="btn-choose-file" class="btn btn-secondary" type="button">Choose file</button>
+        <input id="file-input" type="file" accept=".txt,text/plain" hidden />
+      </div>
+
+      <div id="file-panel" class="file-panel hidden">
+        <div class="file-row">
+          <div class="file-meta">
+            <p class="file-name" id="file-name"></p>
+            <p class="file-sub"><span id="file-size"></span><span id="file-state"></span></p>
+          </div>
+          <div class="file-actions">
+            <button id="btn-replace" class="btn btn-ghost" type="button">Replace</button>
+            <button id="btn-remove" class="btn btn-ghost" type="button">Remove</button>
+          </div>
+        </div>
+
+        <div id="script-summary" class="summary hidden">
+          <div class="summary-head">
+            <label class="title-wrap">
+              <span class="summary-label">Title</span>
+              <input id="book-title" class="title-input" type="text" maxlength="120"
+                     aria-label="Audiobook title" />
+            </label>
+            <div class="chips">
+              <span class="chip">Language: <strong id="language-name">&mdash;</strong></span>
+              <span class="chip"><strong id="paragraph-count">0</strong>&nbsp;paragraphs</span>
+              <span class="chip" id="char-count">0 characters</span>
+              <button id="btn-language-override" class="link-btn" type="button"
+                      aria-expanded="false" aria-controls="language-override-row">Not right?</button>
+            </div>
+          </div>
+          <div id="language-override-row" class="language-override hidden">
+            <label for="language-select">Narrate in</label>
+            <select id="language-select">
+              <option value="">Auto-detect</option>
+              <option value="Afrikaans">Afrikaans</option>
+              <option value="Amharic">Amharic</option>
+              <option value="Arabic">Arabic</option>
+              <option value="Armenian">Armenian</option>
+              <option value="Assamese">Assamese</option>
+              <option value="Asturian">Asturian</option>
+              <option value="Azerbaijani">Azerbaijani</option>
+              <option value="Belarusian">Belarusian</option>
+              <option value="Bengali">Bengali</option>
+              <option value="Bosnian">Bosnian</option>
+              <option value="Bulgarian">Bulgarian</option>
+              <option value="Burmese">Burmese</option>
+              <option value="Cantonese">Cantonese</option>
+              <option value="Catalan">Catalan</option>
+              <option value="Cebuano">Cebuano</option>
+              <option value="Croatian">Croatian</option>
+              <option value="Czech">Czech</option>
+              <option value="Danish">Danish</option>
+              <option value="Dutch">Dutch</option>
+              <option value="English">English</option>
+              <option value="Estonian">Estonian</option>
+              <option value="Filipino">Filipino</option>
+              <option value="Finnish">Finnish</option>
+              <option value="French">French</option>
+              <option value="Fula (Pulaar)">Fula (Pulaar)</option>
+              <option value="Galician">Galician</option>
+              <option value="Georgian">Georgian</option>
+              <option value="German">German</option>
+              <option value="Greek">Greek</option>
+              <option value="Gujarati">Gujarati</option>
+              <option value="Hausa">Hausa</option>
+              <option value="Hebrew">Hebrew</option>
+              <option value="Hindi">Hindi</option>
+              <option value="Hungarian">Hungarian</option>
+              <option value="Icelandic">Icelandic</option>
+              <option value="Indonesian">Indonesian</option>
+              <option value="Italian">Italian</option>
+              <option value="Japanese">Japanese</option>
+              <option value="Javanese">Javanese</option>
+              <option value="Kamba">Kamba</option>
+              <option value="Kannada">Kannada</option>
+              <option value="Kazakh">Kazakh</option>
+              <option value="Korean">Korean</option>
+              <option value="Kyrgyz">Kyrgyz</option>
+              <option value="Lao">Lao</option>
+              <option value="Latvian">Latvian</option>
+              <option value="Lingala">Lingala</option>
+              <option value="Lithuanian">Lithuanian</option>
+              <option value="Luganda">Luganda</option>
+              <option value="Luxembourgish">Luxembourgish</option>
+              <option value="Macedonian">Macedonian</option>
+              <option value="Malay">Malay</option>
+              <option value="Malayalam">Malayalam</option>
+              <option value="Maltese">Maltese</option>
+              <option value="Mandarin Chinese">Mandarin Chinese</option>
+              <option value="Māori">Māori</option>
+              <option value="Marathi">Marathi</option>
+              <option value="Mongolian">Mongolian</option>
+              <option value="Nepali">Nepali</option>
+              <option value="Norwegian">Norwegian</option>
+              <option value="Occitan">Occitan</option>
+              <option value="Odia">Odia</option>
+              <option value="Pashto">Pashto</option>
+              <option value="Persian">Persian</option>
+              <option value="Polish">Polish</option>
+              <option value="Portuguese">Portuguese</option>
+              <option value="Punjabi">Punjabi</option>
+              <option value="Romanian">Romanian</option>
+              <option value="Russian">Russian</option>
+              <option value="Serbian">Serbian</option>
+              <option value="Shona">Shona</option>
+              <option value="Sindhi">Sindhi</option>
+              <option value="Slovak">Slovak</option>
+              <option value="Slovenian">Slovenian</option>
+              <option value="Somali">Somali</option>
+              <option value="Sorani Kurdish">Sorani Kurdish</option>
+              <option value="Spanish">Spanish</option>
+              <option value="Swahili">Swahili</option>
+              <option value="Swedish">Swedish</option>
+              <option value="Tajik">Tajik</option>
+              <option value="Tamil">Tamil</option>
+              <option value="Telugu">Telugu</option>
+              <option value="Thai">Thai</option>
+              <option value="Turkish">Turkish</option>
+              <option value="Ukrainian">Ukrainian</option>
+              <option value="Urdu">Urdu</option>
+              <option value="Uzbek">Uzbek</option>
+              <option value="Vietnamese">Vietnamese</option>
+              <option value="Welsh">Welsh</option>
+              <option value="Wolof">Wolof</option>
+              <option value="Zulu">Zulu</option>
+            </select>
+          </div>
+          <p class="script-preview" id="script-preview"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────── 2 · Multi-Character Voice Casting ──────────────── -->
+    <section class="card hidden" id="casting-card" aria-labelledby="casting-heading">
+      <h2 id="casting-heading"><span class="step-badge" id="step-badge-casting" aria-hidden="true">2</span> Multi-Character Voice Casting</h2>
+
+      <label class="toggle-row" for="mv-toggle">
+        <input type="checkbox" id="mv-toggle" />
+        <span class="toggle-text">
+          <strong>Use Multiple Character Voices</strong>
+          <span class="toggle-desc">
+            Let AI identify the narrator and characters, recommend suitable voices,
+            and create a multi-voice audiobook.
+          </span>
+        </span>
+      </label>
+
+      <div id="casting-body" class="hidden">
+        <p class="hint" id="cast-progress" role="status" aria-live="polite"></p>
+
+        <div id="cast-roles-wrap" class="hidden">
+          <p class="cast-count" id="cast-role-count"></p>
+          <table class="roles-table">
+            <thead>
+              <tr><th scope="col">Role</th><th scope="col">Description</th></tr>
+            </thead>
+            <tbody id="cast-roles-body"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="cast-note"></p>
+
+        <div id="cast-modes" class="hidden" role="radiogroup" aria-label="Casting mode">
+          <p class="cast-mode-label">Casting mode:</p>
+          <div class="mode-switch">
+            <label class="mode-option" id="cast-mode-auto-label" for="cast-mode-auto">
+              <input type="radio" name="cast-mode" id="cast-mode-auto" value="auto" checked />
+              <span>Let AI choose the voices</span>
+            </label>
+            <label class="mode-option" id="cast-mode-manual-label" for="cast-mode-manual">
+              <input type="radio" name="cast-mode" id="cast-mode-manual" value="manual" />
+              <span>I&rsquo;ll choose the voices</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="cast-cards"></div>
+
+        <div class="casting-actions">
+          <button id="btn-casting-continue" class="btn btn-primary" type="button" disabled>
+            Character Analyser
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ──────────────────────── 3 · Narration style ───────────────────── -->
+    <section class="card" aria-labelledby="style-heading">
+      <h2 id="style-heading"><span class="step-badge" id="step-badge-style" aria-hidden="true">3</span> Narration style</h2>
+      <div class="style-grid" role="radiogroup" aria-label="Narration style">
+        <button type="button" class="style-card" role="radio" aria-checked="true"
+                data-style="natural" id="style-natural">
+          <span class="style-name">Natural</span>
+          <span class="style-desc">Clear, conversational, realistic narration.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="cinematic" id="style-cinematic" tabindex="-1">
+          <span class="style-name">Cinematic</span>
+          <span class="style-desc">Immersive and emotionally controlled storytelling.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="expressive" id="style-expressive" tabindex="-1">
+          <span class="style-name">Expressive</span>
+          <span class="style-desc">More emotional variation when the story requires it.</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ────────────────────────── 4 · Generate ────────────────────────── -->
+    <section class="card" aria-labelledby="generate-heading">
+      <h2 id="generate-heading"><span class="step-badge" id="step-badge-generate" aria-hidden="true">4</span> Generate</h2>
+      <button id="btn-generate" class="btn btn-primary btn-big" type="button" disabled>
+        Generate Audiobook
+      </button>
+      <p class="hint" id="generate-hint">Upload a script to get started.</p>
+      <p class="hint" id="usage-line"></p>
+      <p class="hint warn hidden" id="quota-note"></p>
+    </section>
+
+    <!-- ────────────────────────── Progress ────────────────────────────── -->
+    <section class="card hidden" id="progress-card" aria-labelledby="progress-heading">
+      <h2 id="progress-heading">Creating your audiobook</h2>
+      <ol class="stages" id="stage-list">
+        <li data-stage="upload">Uploading script</li>
+        <li data-stage="understand">Understanding your story</li>
+        <li data-stage="prepare">Preparing narration</li>
+        <li data-stage="generate">Generating voices &amp; assembling audiobook</li>
+        <li data-stage="done">Completed</li>
+      </ol>
+      <p class="hint" id="progress-note"></p>
+    </section>
+
+    <!-- ──────────────────────────── Result ────────────────────────────── -->
+    <section class="card result-card hidden" id="result-card" aria-labelledby="result-title">
+      <h2 class="result-title" id="result-title">Your audiobook</h2>
+      <p class="result-meta">
+        <span id="result-language"></span>
+        <span class="dot" aria-hidden="true">&middot;</span>
+        <span id="result-duration"></span>
+      </p>
+      <audio id="audio-player" controls preload="metadata"></audio>
+      <div class="result-actions">
+        <a id="btn-download" class="btn btn-primary" download href="#">Download MP3</a>
+        <button id="btn-regenerate" class="btn btn-secondary" type="button">Regenerate audiobook</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <div class="privacy">
+      <p>
+        <strong>Private beta.</strong> Uploaded scripts and generated audio are stored
+        on the beta server for testing purposes only — please don't upload confidential
+        manuscripts. Your projects are private to your tester account, and you can
+        delete your projects and their files at any time.
+      </p>
+      <button id="btn-delete-data" class="btn btn-ghost" type="button">
+        Delete my projects &amp; files
+      </button>
+    </div>
+    <p>AI Audiobook &middot; script in, audiobook out</p>
+  </footer>
+
+  <script src="/static/limits.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

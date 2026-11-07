@@ -12,7 +12,8 @@ Hard rules enforced here (spec §1):
   explicitly listed in `uncertain_attributes`;
 * only characters with `has_spoken_dialogue` get voice requirements, plus
   the always-required narrator profile (reserved id `narrator`);
-* a character credited with dialogue must actually be named in the script;
+* a character credited with dialogue must actually be named in the script
+  (any grammatical form / spelling variant of the script's words);
 * invalid model output never reaches disk: it is retried with feedback and
   finally rejected with a useful 502.
 """
@@ -21,11 +22,12 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any, Optional, Sequence
 
 from pydantic import ValidationError
 
-from app.config import LANGUAGE_NAME_TO_CODE, Settings, get_settings
+from app.config import Settings, get_settings, language_to_iso
 from app.schemas.casting import (
     NARRATOR_ID,
     CharacterAnalysisResponse,
@@ -76,9 +78,9 @@ HARD RULES
   "speaking_style": "<how they talk: natural, restrained, theatrical...>",
   "has_spoken_dialogue": true | false
 }
-5. NEVER invent gender, age or accent. When the script does not clearly establish an attribute set it to null. If you infer an attribute with any doubt, keep the value AND list that attribute in uncertain_attributes. uncertain_attributes may only contain "gender", "age" and "accent".
+5. NEVER invent gender, age or accent. When the script does not clearly establish an attribute, set it to null (you may list it in uncertain_attributes to mark it as unknown/uncertain). If you infer an attribute with any doubt, keep the value AND list that attribute in uncertain_attributes. uncertain_attributes may only contain "gender", "age" and "accent".
 6. has_spoken_dialogue is true ONLY when the character actually speaks or is quoted. Characters without spoken dialogue get empty voice_description and speaking_style — no speaking voice is required for them.
-7. Every character credited with dialogue MUST have their character_name appear in the script (dialogue attribution — who says which line).
+7. Every character credited with dialogue MUST be named in the script (dialogue attribution — who says which line). character_name may only use words that occur in the script — grammatical forms of those words are fine (e.g. 'बूढ़ा आदमी' for the script's 'बूढ़े आदमी'), but never invent a name assembled from words that are not in the script. If a speaker is NEVER named in the script (e.g. an unseen voice), do NOT invent a name: either credit the narrator with those lines, or use a short exact phrase from the script that refers to that speaker.
 8. voice_description and speaking_style are mandatory for the narrator and every character with has_spoken_dialogue=true: ground them in the script (restrained, natural audiobook delivery — not theatrical).
 9. Include every character that appears, in first-appearance order. Never merge two characters; never invent one."""
 
@@ -105,6 +107,10 @@ def build_user_prompt(script_paragraphs: Sequence[str], feedback: Optional[Seque
             "",
             "Fix every problem above and return the complete corrected JSON "
             "object only.",
+            "Remember: character_name may only use words that appear in the "
+            "script (grammatical forms are fine). If a speaker is not named "
+            "in the script, credit the narrator with their lines or use a "
+            "short exact phrase from the script — never invent a name.",
         ]
     return "\n".join(parts)
 
@@ -122,15 +128,74 @@ def strip_code_fences(raw: str) -> str:
 
 def normalize_language(value: str) -> str:
     """Prefer an ISO 639-1 code; fall back to the raw value untouched."""
-    cleaned = (value or "").strip()
-    if not cleaned:
-        return cleaned
-    mapped = LANGUAGE_NAME_TO_CODE.get(cleaned.lower())
-    if mapped:
-        return mapped
-    if len(cleaned) == 2 and cleaned.isalpha():
-        return cleaned.lower()
-    return cleaned
+    return language_to_iso(value)
+
+
+# --------------------------------------------------------------------------- #
+# Name grounding (the "named in the script" check, orthography-tolerant)
+# --------------------------------------------------------------------------- #
+# Real scripts vary in spelling: Devanagari nukta (आवाज / आवाज़), zero-width
+# marks, whitespace/line wraps and grammatical case (बूढ़ा / बूढ़े). The rule
+# stays strict about WORDS — every identifying word of a credited name must be
+# grounded in the script — while tolerating those orthographic variants.
+_WORD = re.compile(r"\w+", re.UNICODE)
+_ZERO_WIDTH = re.compile(r"[\u200b-\u200d\ufeff]")
+_WS = re.compile(r"\s+")
+# Postpositions/conjunctions carry no identity — only content words must match.
+_NAME_STOPWORDS = frozenset(
+    "का की के को ने से पर में और यह वह एक इस उस कि तो भी ही "
+    "the of a an and or".split()
+)
+
+
+def _fold_word(word: str) -> str:
+    """One canonical form per word: NFKC, no zero-width marks, no nukta."""
+    folded = unicodedata.normalize("NFKC", word or "")
+    folded = _ZERO_WIDTH.sub("", folded)
+    folded = folded.replace("\u093c", "")  # Devanagari nukta
+    return folded.casefold()
+
+
+def _words_of(text: str) -> list[str]:
+    return [_fold_word(word) for word in _WORD.findall(text or "")]
+
+
+def _words_match(name_word: str, script_word: str) -> bool:
+    """True when one word is a (grammatical) variant of the other."""
+    if name_word == script_word:
+        return True
+    shorter, longer = (
+        (name_word, script_word)
+        if len(name_word) <= len(script_word)
+        else (script_word, name_word)
+    )
+    if len(shorter) >= 3 and longer.startswith(shorter):
+        return True  # होटल / होटलों — stem + suffix
+    # Hindi inflection often swaps the final vowel (बूढ़ा / बूढ़े): accept a
+    # shared stem of 3+ characters between longer words.
+    if len(name_word) >= 4 and len(script_word) >= 4:
+        common = 0
+        for left, right in zip(name_word, script_word):
+            if left != right:
+                break
+            common += 1
+        return common >= 3
+    return False
+
+
+def name_is_grounded(name: str, script_words: Sequence[str]) -> bool:
+    """Every identifying word of `name` occurs in the script (any inflection)."""
+    content = [
+        word
+        for word in _words_of(name)
+        if word not in _NAME_STOPWORDS
+    ]
+    if not content:
+        return False
+    return all(
+        any(_words_match(word, script_word) for script_word in script_words)
+        for word in content
+    )
 
 
 def validate_analysis_against_script(
@@ -139,7 +204,7 @@ def validate_analysis_against_script(
     """Cross-check the cast against the uploaded script. Returns problems."""
     problems: list[str] = []
     script = "\n".join(script_paragraphs)
-    script_lower = script.lower()
+    script_words = _words_of(script)
 
     if analysis.narrator.character_id != NARRATOR_ID:
         problems.append(f"narrator.character_id must be '{NARRATOR_ID}'")
@@ -147,7 +212,7 @@ def validate_analysis_against_script(
     for character in analysis.characters:
         label = f"character '{character.character_id}'"
         if character.has_spoken_dialogue:
-            if character.character_name.strip().lower() not in script_lower:
+            if not name_is_grounded(character.character_name, script_words):
                 problems.append(
                     f"{label}: character_name '{character.character_name}' never "
                     "appears in the script — do not invent characters credited "
@@ -163,18 +228,10 @@ def validate_analysis_against_script(
                     f"{label}: speaking_style is required for characters "
                     "with spoken dialogue"
                 )
-        # Attributes must be null when listed as uncertain-unproven OR the
-        # value must be explicitly flagged — never silently invented.
-        for attribute in ("gender", "age", "accent"):
-            value = getattr(character, attribute)
-            if value and attribute not in character.uncertain_attributes:
-                # Established (not flagged) is fine — nothing to verify here.
-                pass
-            if value is None and attribute in character.uncertain_attributes:
-                problems.append(
-                    f"{label}: uncertain_attributes lists '{attribute}' but the "
-                    "value is null — remove it from the list or provide the value"
-                )
+        # Attributes must NEVER be invented: unstated -> null, inferred ->
+        # kept with the attribute listed in uncertain_attributes. A null
+        # value listed as uncertain simply means "the script never
+        # established it" — the model's natural encoding of an unknown.
 
     if not analysis.narrator.voice_description.strip():
         problems.append("narrator: voice_description is required")

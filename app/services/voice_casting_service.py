@@ -27,7 +27,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, language_to_iso
 from app.schemas.casting import (
     AuditionRequest,
     CharacterCast,
@@ -54,6 +54,8 @@ from app.services.voice_discovery import (
 from app.services.voice_matcher import (
     RawVoice,
     normalize_account_voice,
+    normalize_age,
+    normalize_gender,
     normalize_shared_voice,
     rank_candidates,
 )
@@ -64,6 +66,18 @@ CANDIDATES_PER_SPEAKER = 3
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _dedupe(pool: list[RawVoice]) -> list[RawVoice]:
+    """Unique voices by id — the first occurrence wins (account before shared)."""
+    seen: set[str] = set()
+    unique: list[RawVoice] = []
+    for voice in pool:
+        if not voice.voice_id or voice.voice_id in seen:
+            continue
+        seen.add(voice.voice_id)
+        unique.append(voice)
+    return unique
 
 
 def _supported_voice_settings(model_id: str) -> list[str]:
@@ -130,6 +144,7 @@ class VoiceCastingService:
             characters=characters,
             missing_speakers=missing,
             saved_at=saved_at,
+            story=cast.story,
         )
 
     # ------------------------------------------------------------------ #
@@ -137,17 +152,31 @@ class VoiceCastingService:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _filters_for(profile: CharacterProfile, story_language: str, locale: Optional[str]) -> VoiceSearchFilters:
-        """Server-side filters — ONLY attributes the script established."""
+        """Server-side filters — ONLY attributes the script established.
+
+        Age/gender are canonicalised to the provider's enum vocabulary
+        ("mature" -> "middle_aged", "elderly" -> "old", …); an unrecognised
+        value is dropped instead of being sent and emptying the results.
+        """
         established_gender = profile.gender and "gender" not in profile.uncertain_attributes
         established_age = profile.age and "age" not in profile.uncertain_attributes
         established_accent = profile.accent and "accent" not in profile.uncertain_attributes
         return VoiceSearchFilters(
-            language=(profile.language or story_language or "").lower() or None,
+            language=language_to_iso(profile.language or story_language or "") or None,
             locale=locale,
-            gender=profile.gender.lower() if established_gender else None,
-            age=profile.age.lower() if established_age else None,
+            gender=normalize_gender(profile.gender) if established_gender else None,
+            age=normalize_age(profile.age) if established_age else None,
             accent=profile.accent.lower() if established_accent else None,
         )
+
+    async def _pool(
+        self, filters: VoiceSearchFilters, *, shared: bool
+    ) -> list[RawVoice]:
+        if shared:
+            raw = await self.discovery.list_shared_voices(filters)
+            return [v for v in (normalize_shared_voice(i) for i in raw) if v]
+        raw = await self.discovery.list_account_voices(filters)
+        return [v for v in (normalize_account_voice(i) for i in raw) if v]
 
     async def build_casting(self, project_id: str) -> VoiceCastingResponse:
         cast = self._load(project_id)
@@ -160,10 +189,7 @@ class VoiceCastingService:
             )
 
             # 1) account voices first …
-            account_raw = await self.discovery.list_account_voices(filters)
-            account_pool = [
-                v for v in (normalize_account_voice(i) for i in account_raw) if v
-            ]
+            account_pool = await self._pool(filters, shared=False)
             candidates = rank_candidates(
                 speaker,
                 account_pool,
@@ -173,17 +199,38 @@ class VoiceCastingService:
             )
 
             # 2) … library voices only when the account pool is too thin.
+            merged: list[RawVoice] = account_pool
             if len(candidates) < CANDIDATES_PER_SPEAKER:
-                shared_raw = await self.discovery.list_shared_voices(filters)
-                shared_pool = [
-                    v for v in (normalize_shared_voice(i) for i in shared_raw) if v
-                ]
-                merged: list[RawVoice] = account_pool + shared_pool
+                merged = account_pool + await self._pool(filters, shared=True)
                 candidates = rank_candidates(
                     speaker,
                     merged,
                     required_language=story.language,
                     required_locale=story.locale,
+                    limit=CANDIDATES_PER_SPEAKER,
+                )
+
+            # 3) EVERY speaking role ends up with candidates — "No candidate
+            #    available" blocks the whole cast. Relax the demographics
+            #    filters and the match-score threshold before ever showing
+            #    none; language compatibility stays a hard rule (an English
+            #    voice never narrates a Hindi story) and restricted voices
+            #    stay excluded at every level.
+            if not candidates:
+                relaxed = VoiceSearchFilters(
+                    language=filters.language, locale=filters.locale
+                )
+                merged = _dedupe(
+                    merged
+                    + await self._pool(relaxed, shared=False)
+                    + await self._pool(relaxed, shared=True)
+                )
+                candidates = rank_candidates(
+                    speaker,
+                    merged,
+                    required_language=story.language,
+                    required_locale=story.locale,
+                    min_accept_score=0.0,
                     limit=CANDIDATES_PER_SPEAKER,
                 )
 
@@ -225,8 +272,18 @@ class VoiceCastingService:
         if not voice_id:
             raise VoiceSelectionError("voice_id must not be empty")
 
+        # The candidate we already hold for this voice — its name is the
+        # voice's REAL name and must survive the import/lock round trip
+        # (never the character's name).
+        entry = cast.casting_for(speaker.character_id)
+        known = next(
+            (c for c in entry.candidates if c.voice_id == voice_id), None
+        )
+        original_name = (known.name if known else "") or ""
+
         # Import a library voice into the account when its owner is given —
-        # never for voices we cannot verify.
+        # never for voices we cannot verify. The import keeps the voice's own
+        # name so the account and the UI always agree.
         origin: str = "account"
         original_voice_id: Optional[str] = None
         if request.public_owner_id:
@@ -235,7 +292,9 @@ class VoiceCastingService:
             voice_id = await self.discovery.add_shared_voice(
                 request.public_owner_id.strip(),
                 voice_id,
-                (request.new_name or "").strip() or speaker.character_name,
+                (request.new_name or "").strip()
+                or original_name
+                or speaker.character_name,
             )
 
         # Verify the voice really exists (GET /v1/voices/{voice_id}) —
@@ -267,9 +326,11 @@ class VoiceCastingService:
             character_id=speaker.character_id,
             voice_id=voice_id,
             original_voice_id=original_voice_id,
-            voice_name=(normalized.name if normalized else "") or voice_id,
+            voice_name=original_name
+            or (normalized.name if normalized else "")
+            or voice_id,
             provider="elevenlabs",
-            language=(speaker.language or cast.story.language or "").lower() or None,
+            language=language_to_iso(speaker.language or cast.story.language or "") or None,
             accent=(normalized.accent if normalized else None) or speaker.accent,
             voice_metadata={
                 k: v

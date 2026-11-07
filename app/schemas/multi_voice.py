@@ -132,3 +132,32 @@ class MultiVoicePlanResponse(BaseModel):
             saved=saved,
             saved_at=saved_at,
         )
+
+
+class MultiVoicePlanStatusResponse(BaseModel):
+    """Server-authoritative multi-voice plan status (never charged, GET).
+
+    The browser uses this to restore a plan after a reload or a cleared
+    `localStorage`: `ready_for_generate` is the ONLY signal that may seed
+    the frontend's "plan already created" cache — existence and validity
+    are always decided by the server from the stored project data.
+    """
+
+    project_id: str
+    exists: bool
+    status: str = Field(
+        description=(
+            "none | creating | ready | started | completed | failed"
+        )
+    )
+    valid: bool = Field(
+        description="A saved plan artefact describes the current inputs."
+    )
+    ready_for_generate: bool = Field(
+        description="An unfinished, valid plan may be generated (or reused)."
+    )
+    plan_id: Optional[str] = None
+    plan_fingerprint: Optional[str] = None
+    generation_id: Optional[str] = None
+    created_at: Optional[str] = None  # ISO-8601 (as persisted)
+    updated_at: Optional[str] = None

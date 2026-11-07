@@ -1,6 +1,16 @@
 """Pydantic schemas exposed by the API."""
 
 from app.schemas.audio import AudioResponse
+from app.schemas.audio_analysis import (
+    AudioAnalysisNormalized,
+    AudioAnalysisStartResponse,
+    AudioAnalysisStatusResponse,
+    NormalizedSpeaker,
+    NormalizedSpeakerTurn,
+    NormalizedTurnTranscription,
+    NormalizedWord,
+    ValidationIssue,
+)
 from app.schemas.casting import (
     AuditionRequest,
     CharacterAnalysisResponse,
@@ -28,11 +38,20 @@ from app.schemas.narration import (
     DELIVERY_STYLES,
     EMOTIONS,
     DeliveryStyle,
+    EffectiveVoiceSettings,
     Emotion,
     NarrationPlan,
     NarrationPlanResponse,
+    NarrationPreviewResponse,
     ParagraphPlan,
+    VoiceModelInfo,
     VoiceSettings,
+)
+from app.schemas.narration_preferences import (
+    AnalyzeNarrationRequest,
+    NarrationPreferences,
+    NarrationPreferencesResponse,
+    PreviewNarrationRequest,
 )
 from app.schemas.project import (
     HealthResponse,
@@ -46,6 +65,10 @@ from app.schemas.project import (
 __all__ = [
     "DELIVERY_STYLES",
     "EMOTIONS",
+    "AnalyzeNarrationRequest",
+    "AudioAnalysisNormalized",
+    "AudioAnalysisStartResponse",
+    "AudioAnalysisStatusResponse",
     "AudioEffectsBackgroundNoise",
     "AudioEffectsCatalog",
     "AudioEffectsEnvironment",
@@ -56,13 +79,22 @@ __all__ = [
     "CharacterCast",
     "CharacterProfile",
     "DeliveryStyle",
+    "EffectiveVoiceSettings",
     "Emotion",
     "HealthResponse",
     "MultiVoicePlan",
     "MultiVoicePlanResponse",
     "NarrationPlan",
     "NarrationPlanResponse",
+    "NarrationPreferences",
+    "NarrationPreferencesResponse",
+    "NarrationPreviewResponse",
+    "NormalizedSpeaker",
+    "NormalizedSpeakerTurn",
+    "NormalizedTurnTranscription",
+    "NormalizedWord",
     "ParagraphPlan",
+    "PreviewNarrationRequest",
     "ProjectCreateRequest",
     "ProjectResponse",
     "ScriptInfo",
@@ -71,9 +103,11 @@ __all__ = [
     "StoryAnalysis",
     "UploadScriptResponse",
     "Utterance",
+    "ValidationIssue",
     "VoiceCastingResponse",
     "VoiceCandidate",
     "VoiceLock",
+    "VoiceModelInfo",
     "VoiceSettings",
     "WelcomeResponse",
 ]

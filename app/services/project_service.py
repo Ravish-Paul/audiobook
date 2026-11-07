@@ -13,6 +13,7 @@ Storage layout:
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,9 +23,11 @@ from app.config import Settings, get_settings
 from app.schemas.casting import CharacterCast
 from app.schemas.multi_voice import MultiVoicePlan
 from app.schemas.narration import NarrationPlan
+from app.schemas.narration_preferences import NarrationPreferences
 from app.schemas.project import (
     ProjectCreateRequest,
     ProjectResponse,
+    ScriptImportResponse,
     ScriptInfo,
     UploadScriptResponse,
 )
@@ -37,6 +40,12 @@ from app.services.errors import (
     ScriptTooLargeError,
     ScriptValidationError,
 )
+from app.services.script_import import (
+    detect_script_language,
+    detect_title,
+    script_preview,
+)
+from app.services.script_limits import check_script_limits
 
 METADATA_FILENAME = "project.json"
 
@@ -83,7 +92,9 @@ class ProjectService:
     # ------------------------------------------------------------------ #
     # Projects
     # ------------------------------------------------------------------ #
-    def create_project(self, payload: ProjectCreateRequest) -> ProjectResponse:
+    def create_project(
+        self, payload: ProjectCreateRequest, owner: Optional[str] = None
+    ) -> ProjectResponse:
         self.ensure_storage()
 
         project_id = str(uuid.uuid4())
@@ -94,6 +105,8 @@ class ProjectService:
             "description": payload.description,
             "created_at": now.isoformat(),
             "script": None,
+            # Private beta: which tester owns this project (None in dev mode).
+            "owner": owner,
         }
         self._write_metadata(self._metadata_path(project_id), record)
         return self._to_response(record)
@@ -114,6 +127,74 @@ class ProjectService:
         return bool(project_id) and self._metadata_path(project_id).is_file()
 
     # ------------------------------------------------------------------ #
+    # Deletion (private-beta privacy: testers can delete their data)
+    # ------------------------------------------------------------------ #
+    def delete_project(self, project_id: str) -> None:
+        """Remove one project and every file it owns (404 when unknown)."""
+        if not project_id or not self._metadata_path(project_id).is_file():
+            raise ProjectNotFoundError(project_id)
+
+        project_dir = self._project_dir(project_id)
+        try:
+            shutil.rmtree(project_dir)
+        except OSError as exc:
+            raise ProjectError(
+                f"Could not delete project '{project_id}': {exc}"
+            ) from exc
+
+    def delete_projects_owned_by(self, owner: Optional[str]) -> int:
+        """Delete every project owned by `owner`; returns how many were removed."""
+        if not owner:
+            return 0
+        self.ensure_storage()
+        removed = 0
+        for entry in self.storage_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            meta_path = entry / METADATA_FILENAME
+            if not meta_path.is_file():
+                continue
+            try:
+                record = self._read_metadata(meta_path)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if record.get("owner") != owner:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        return removed
+
+    def list_projects_owned_by(self, owner: Optional[str]) -> list[ProjectResponse]:
+        """Every project owned by `owner`, newest first — never anyone else's.
+
+        Lets the frontend restore the tester's own project after the browser
+        lost its localStorage (same enumeration + owner filter as the
+        deletion path above).
+        """
+        if not owner:
+            return []
+        self.ensure_storage()
+        projects: list[ProjectResponse] = []
+        for entry in self.storage_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            meta_path = entry / METADATA_FILENAME
+            if not meta_path.is_file():
+                continue
+            try:
+                record = self._read_metadata(meta_path)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if record.get("owner") != owner:
+                continue
+            try:
+                projects.append(self._to_response(record))
+            except (ValueError, TypeError, ProjectError):
+                continue  # a corrupt record is never listed
+        projects.sort(key=lambda p: p.created_at, reverse=True)
+        return projects
+
+    # ------------------------------------------------------------------ #
     # Script upload
     # ------------------------------------------------------------------ #
     def upload_script(
@@ -122,6 +203,62 @@ class ProjectService:
         """Validate and store an uploaded script for an existing project."""
         project = self.get_project(project_id)  # raises 404 when unknown
 
+        text = self._validate_and_decode(filename, content)
+        script_info = self._store_script(project_id, filename, text)
+
+        script_path = (
+            self._project_dir(project_id) / self.settings.stored_script_filename
+        )
+        return UploadScriptResponse(
+            project_id=project.project_id,
+            filename=script_info["filename"],
+            character_count=script_info["character_count"],
+            upload_status="success",
+            size_bytes=script_info["size_bytes"],
+            stored_path=str(script_path.relative_to(self.storage_dir.parent.parent)),
+            uploaded_at=datetime.fromisoformat(script_info["uploaded_at"]),
+        )
+
+    def import_script(
+        self, filename: str, content: bytes, owner: Optional[str] = None
+    ) -> ScriptImportResponse:
+        """One-step import for the simple creator UI (auto-created project).
+
+        Validates the upload exactly like `upload_script`, derives the book
+        title and language from the text (deterministic — never an LLM call),
+        creates the project and stores the script. All done in that order so
+        a rejected file never leaves an orphan project behind.
+        """
+        text = self._validate_and_decode(filename, content)
+
+        title = detect_title(text, filename)
+        language = detect_script_language(text)
+
+        project = self.create_project(ProjectCreateRequest(name=title), owner=owner)
+        script_info = self._store_script(project.project_id, filename, text)
+
+        # Lazy import: narration_planner imports this module at import time.
+        from app.services.narration_planner import split_paragraphs
+
+        return ScriptImportResponse(
+            project_id=project.project_id,
+            title=title,
+            language=language.name,
+            language_code=language.code or None,
+            paragraph_count=len(split_paragraphs(text)),
+            filename=script_info["filename"],
+            size_bytes=script_info["size_bytes"],
+            character_count=script_info["character_count"],
+            script_preview=script_preview(text),
+            upload_status="success",
+            uploaded_at=datetime.fromisoformat(script_info["uploaded_at"]),
+        )
+
+    def _validate_and_decode(self, filename: str, content: bytes) -> str:
+        """Shared upload validation (size, extension, UTF-8) -> decoded text.
+
+        Raises ScriptTooLargeError (413) / ScriptValidationError (400).
+        """
         # 1) size limit (defence in depth: the route also checks Content-Length)
         max_bytes = self.settings.max_script_size_bytes
         if len(content) > max_bytes:
@@ -143,7 +280,14 @@ class ProjectService:
                 "Script must be a valid UTF-8 encoded text file"
             ) from exc
 
-        # 4) persist
+        # 4) private-beta length / estimated-duration limits
+        check_script_limits(self.settings, text)
+        return text
+
+    def _store_script(
+        self, project_id: str, filename: str, text: str
+    ) -> dict[str, Any]:
+        """Persist `script.txt` + metadata; returns the `script_info` record."""
         project_dir = self._project_dir(project_id)
         project_dir.mkdir(parents=True, exist_ok=True)
         script_path = project_dir / self.settings.stored_script_filename
@@ -163,16 +307,7 @@ class ProjectService:
         record = self._read_metadata(meta_path)
         record["script"] = script_info
         self._write_metadata(meta_path, record)
-
-        return UploadScriptResponse(
-            project_id=project.project_id,
-            filename=script_info["filename"],
-            character_count=script_info["character_count"],
-            upload_status="success",
-            size_bytes=script_info["size_bytes"],
-            stored_path=str(script_path.relative_to(self.storage_dir.parent.parent)),
-            uploaded_at=uploaded_at,
-        )
+        return script_info
 
     # ------------------------------------------------------------------ #
     # Script reading (used by audio generation — no re-upload required)
@@ -293,6 +428,67 @@ class ProjectService:
         except Exception:
             return None
         return plan, saved_at
+
+    # ------------------------------------------------------------------ #
+    # Narration preferences (user controlled direction, per project)
+    # ------------------------------------------------------------------ #
+    def narration_preferences_path(self, project_id: str) -> Path:
+        """storage/projects/{project_id}/narration_preferences.json"""
+        return (
+            self._project_dir(project_id)
+            / self.settings.narration_preferences_filename
+        )
+
+    def save_narration_preferences(
+        self, project_id: str, preferences: NarrationPreferences
+    ) -> datetime:
+        """Persist the user's narration preferences and return when saved."""
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+
+        saved_at = _utcnow()
+        payload: dict[str, Any] = {
+            # Nested (not flat): NarrationPreferences uses extra="forbid".
+            "preferences": preferences.model_dump(mode="json"),
+            "project_id": project_id,
+            "saved_at": saved_at.isoformat(),
+        }
+
+        path = self.narration_preferences_path(project_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            raise ProjectError(
+                f"Could not save the narration preferences: {exc}"
+            ) from exc
+        return saved_at
+
+    def get_narration_preferences(
+        self, project_id: str
+    ) -> Optional[tuple[NarrationPreferences, Optional[datetime]]]:
+        """Load narration_preferences.json -> (preferences, saved_at) or None."""
+        path = self.narration_preferences_path(project_id)
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        saved_raw = data.get("saved_at") if isinstance(data, dict) else None
+        saved_at = (
+            datetime.fromisoformat(saved_raw) if isinstance(saved_raw, str) else None
+        )
+        try:
+            preferences = NarrationPreferences.model_validate(
+                data.get("preferences", data) if isinstance(data, dict) else data
+            )
+        except Exception:
+            return None
+        return preferences, saved_at
 
     # ------------------------------------------------------------------ #
     # Character cast (AI casting pipeline)

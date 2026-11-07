@@ -362,6 +362,119 @@ def test_analyze_rejects_invented_dialogue_character(
     assert character_ids == ["suman", "rahul"]   # the invented ghost is gone
 
 
+def _project_with(client: TestClient, script: str) -> str:
+    project_id = client.post(
+        "/projects", json={"name": "Name Grounding"}
+    ).json()["project_id"]
+    upload = client.post(
+        f"/projects/{project_id}/upload-script",
+        files={"file": ("script.txt", script.encode("utf-8"), "text/plain")},
+    )
+    assert upload.status_code == 201
+    return project_id
+
+
+def _speaking_character(character_id: str, name: str) -> dict:
+    return {
+        "character_id": character_id,
+        "character_name": name,
+        "role": "minor_character",
+        "language": "hi",
+        "gender": None, "age": None, "accent": None,
+        "uncertain_attributes": [],
+        "voice_description": "Eerie whispering voice",
+        "speaking_style": "Haunting",
+        "has_spoken_dialogue": True,
+    }
+
+
+def test_analyze_accepts_inflected_and_wrapped_character_names(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Name grounding tolerates real-script spelling variants (not inventions).
+
+    Live failure this pins: MiMo wrote 'बूढ़ा आदमी' (direct case) for a script
+    that says 'बूढ़े आदमी' (oblique), and 'आईने की आवाज़' where the script wraps
+    the phrase across a line break and spells it without the nukta — all three
+    describe speakers that ARE named in the script.
+    """
+    script = (
+        "रिसेप्शन पर बैठे बूढ़े आदमी ने चाबी दी।\n\n"
+        "रात को आईने की\nआवाज़ गूंजी। समीर डर गया।"
+    )
+    project = _project_with(client, script)
+
+    story = make_story_analysis_dict()
+    story["characters"] = [
+        _speaking_character("old_receptionist", "बूढ़ा आदमी"),  # case variant
+        _speaking_character("mirror_voice", "आईने की आवाज़"),    # wrap + nukta
+    ]
+    fake = FakeMiMo([json.dumps(story, ensure_ascii=False)])
+    _use_analyzer(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project}/analyze-characters")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 1  # grounded names — no rejection loop
+    names = [
+        c["character_name"] for c in response.json()["story"]["characters"]
+    ]
+    assert names == ["बूढ़ा आदमी", "आईने की आवाज़"]
+
+
+def test_analyze_still_rejects_names_with_ungrounded_words(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name containing words that are NOWHERE in the script stays rejected.
+
+    The mirror voice below is never named in this script (only 'फुसफुसाहट'):
+    composing 'आईने की आवाज़' would invent a character credited with dialogue.
+    """
+    script = "समीर कमरे में गया।\n\nफुसफुसाहट गूंजी, \"कौन है?\""
+    project = _project_with(client, script)
+
+    bad = make_story_analysis_dict()
+    bad["characters"] = [_speaking_character("mirror_voice", "आईने की आवाज़")]
+    good = make_story_analysis_dict()
+    good["characters"] = []  # narrator-only correction
+    fake = FakeMiMo([json.dumps(bad, ensure_ascii=False),
+                     json.dumps(good, ensure_ascii=False)])
+    _use_analyzer(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project}/analyze-characters")
+    assert response.status_code == 200, response.text
+
+    assert fake.call_count == 2
+    feedback = fake.calls[1]["user"]
+    assert "never appears in the script" in feedback
+    assert "never invent a name" in feedback  # actionable retry guidance
+    assert response.json()["story"]["characters"] == []
+
+
+def test_analyze_accepts_null_attributes_marked_uncertain(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gender: null` + `uncertain_attributes: ["gender"]` is a VALID way to
+    say "the script never established it" (live bug: MiMo's natural encoding
+    was rejected three times and the whole analysis failed).
+    """
+    script = "सुमन ने चाबी सौंपी और चेतावनी दी, कभी आईने में मत देखना।"
+    project = _project_with(client, script)
+
+    character = _speaking_character("suman", "सुमन")
+    character["uncertain_attributes"] = ["gender", "age"]
+    story = make_story_analysis_dict()
+    story["characters"] = [character]
+    fake = FakeMiMo([json.dumps(story, ensure_ascii=False)])
+    _use_analyzer(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project}/analyze-characters")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 1  # accepted first try — no rejection loop
+    saved = response.json()["story"]["characters"][0]
+    assert saved["gender"] is None  # nothing invented
+    assert saved["uncertain_attributes"] == ["gender", "age"]
+
+
 # --------------------------------------------------------------------------- #
 # 2. Voice discovery + ranking (§3/§4)
 # --------------------------------------------------------------------------- #
@@ -569,6 +682,232 @@ def test_select_shared_voice_imports_it_to_the_account(
     assert lock["voice_id"] == "voice-shared-1"
     assert lock["original_voice_id"] == "voice-shared-1"
     assert lock["origin"] == "shared"
+
+
+class FilterSensitiveCastingMock(CastingMock):
+    """Discovery that finds NOTHING whenever a demographic filter is sent.
+
+    Simulates an account where the strict (gender/age/accent) searches come
+    back empty — the cast must still end up with candidates.
+    """
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if request.url.path in ("/v2/voices", "/v1/shared-voices") and any(
+            key in params for key in ("gender", "age", "accent")
+        ):
+            self.requests.append(
+                {"method": request.method, "path": request.url.path,
+                 "params": params, "body": request.content}
+            )
+            return httpx.Response(
+                200, json={"voices": [], "has_more": False}, request=request
+            )
+        return super().__call__(request)
+
+
+def test_every_speaking_role_always_gets_candidates(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"No candidate available" must never block the cast (live bug).
+
+    Even when every filtered search comes back empty, each speaking role is
+    offered usable voices by the progressive fallback (restricted voices are
+    still excluded at every level).
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    _wire_casting(
+        monkeypatch,
+        FilterSensitiveCastingMock(
+            account_default=ACCOUNT_PAGE,
+            shared_default=EMPTY_PAGE,
+            details=dict(VOICE_DETAILS),
+        ),
+    )
+
+    response = client.post(f"/projects/{project_with_script}/voice-casting")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    entries = [("narrator", body["narrator"])] + list(body["characters"].items())
+    for speaker, entry in entries:
+        assert entry["candidates"], f"{speaker} was left without any voice"
+        assert entry["insufficient_candidates"] is False
+        assert all(
+            c["voice_id"] != "voice-banned" for c in entry["candidates"]
+        ), "restricted voices are never proposed, even in the fallback"
+
+
+def test_demographic_aliases_match_without_emptying_the_pool(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Script words like 'mature'/'elderly' match the voices' enum ages.
+
+    Live bug: the free-text age 'elderly' was sent verbatim as a search
+    filter and compared verbatim against 'old' — the pool came back empty
+    and the character got "No candidate available".
+    """
+    old_man = _speaking_character("rahul", "राहुल")
+    old_man["gender"] = "male"
+    old_man["age"] = "elderly"
+    story = make_story_analysis_dict()
+    story["characters"] = [old_man]
+    fake = FakeMiMo([json.dumps(story, ensure_ascii=False)])
+    _use_analyzer(monkeypatch, fake)
+    assert client.post(
+        f"/projects/{project_with_script}/analyze-characters"
+    ).status_code == 200
+
+    page = {
+        "voices": [
+            account_voice(
+                "voice-old", name="Gravel Elder", gender="male", age="old",
+                description="Deep gravelly elderly man voice for audiobooks",
+            ),
+            account_voice(
+                "voice-young", name="Bright Youth", gender="female", age="young",
+                description="Bright youthful voice for audiobooks",
+            ),
+        ],
+        "has_more": False,
+    }
+    mock = _wire_casting(
+        monkeypatch,
+        _default_mock(account_default=page, shared_default=EMPTY_PAGE),
+    )
+
+    response = client.post(f"/projects/{project_with_script}/voice-casting")
+    assert response.status_code == 200, response.text
+    candidates = response.json()["characters"]["rahul"]["candidates"]
+    assert candidates, "the elderly male speaker must get candidates"
+    assert candidates[0]["voice_id"] == "voice-old"  # the matching voice wins
+
+    # The search filter uses the provider's enum vocabulary.
+    search = next(
+        r for r in mock.requests
+        if r["path"] == "/v2/voices" and "age" in r["params"]
+    )
+    assert search["params"]["age"] == "old"
+    assert search["params"]["gender"] == "male"
+
+
+def test_japanese_story_gets_only_japanese_voices(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extended languages work end-to-end with the SAME hard guarantees.
+
+    The story language NAME ('Japanese') is folded to its ISO code ('ja') for
+    search and matching, every speaking role gets candidates, and an
+    English-only voice is never proposed for a Japanese story.
+    """
+    script = "夜はとても暗かった。ユウジは静かにドアを閉めた。"
+    project = _project_with(client, script)
+
+    yuji = _speaking_character("yuji", "ユウジ")
+    yuji["language"] = "Japanese"
+    story = make_story_analysis_dict()
+    story["language"] = "Japanese"
+    story["locale"] = "ja-JP"
+    story["narrator"]["language"] = "Japanese"
+    story["characters"] = [yuji]
+    fake = FakeMiMo([json.dumps(story, ensure_ascii=False)])
+    _use_analyzer(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project}/analyze-characters")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 1  # grounded name — no rejection loop
+    assert response.json()["story"]["language"] == "ja"  # name -> ISO code
+
+    page = {
+        "voices": [
+            account_voice(
+                "voice-ja", name="Yuki Calm", languages=("ja",),
+                description="Calm Japanese audiobook narration voice",
+            ),
+            account_voice("voice-en", name="English Only", languages=("en",)),
+        ],
+        "has_more": False,
+    }
+    mock = _wire_casting(
+        monkeypatch,
+        _default_mock(account_default=page, shared_default=EMPTY_PAGE),
+    )
+
+    casting = client.post(f"/projects/{project}/voice-casting")
+    assert casting.status_code == 200, casting.text
+    body = casting.json()
+    entries = [("narrator", body["narrator"])] + list(body["characters"].items())
+    for speaker, entry in entries:
+        assert entry["candidates"], f"{speaker} must get Japanese candidates"
+        assert all(
+            c["voice_id"] == "voice-ja" for c in entry["candidates"]
+        ), "an English-only voice must never be proposed for a Japanese story"
+
+    # The search filter carries the folded ISO code, never the raw name.
+    search = next(
+        r for r in mock.requests
+        if r["path"] == "/v2/voices" and "language" in r["params"]
+    )
+    assert search["params"]["language"] == '["ja"]'
+
+
+def test_shared_voice_keeps_its_own_name_when_locked(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked voice is named after the VOICE, never after the character.
+
+    Live bug: imported library voices were renamed to the character's name,
+    so the UI showed "Selected: Narrator" instead of the chosen voice.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    mock = _wire_casting(
+        monkeypatch,
+        _default_mock(
+            account_default={
+                "voices": [
+                    account_voice(
+                        "voice-narrator-01", name="Narrator Deep",
+                        description="Deep, calm, measured narrator voice for audiobooks",
+                    )
+                ],
+                "has_more": False,
+            },
+            shared_default={
+                "voices": [shared_voice("voice-shared-1", name="Library Whisper")],
+                "has_more": False,
+            },
+        ),
+    )
+    built = client.post(f"/projects/{project_with_script}/voice-casting")
+    assert built.status_code == 200, built.text
+
+    body = built.json()
+    entries = [("narrator", body["narrator"])] + list(body["characters"].items())
+    speaker, _entry = next(
+        (sid, entry)
+        for sid, entry in entries
+        if any(c["voice_id"] == "voice-shared-1" for c in entry["candidates"])
+    )
+
+    response = client.post(
+        f"/projects/{project_with_script}/voice-casting/select",
+        json={
+            "speaker_id": speaker,
+            "voice_id": "voice-shared-1",
+            "public_owner_id": "owner-abc",
+        },  # NO new_name — the import must keep the voice's own name
+    )
+    assert response.status_code == 200, response.text
+    lock = (
+        response.json()["narrator"]
+        if speaker == "narrator"
+        else response.json()["characters"][speaker]
+    )["selected"]
+    assert lock["voice_name"] == "Library Whisper"
+
+    imported = next(
+        r for r in mock.requests if r["path"].startswith("/v1/voices/add/")
+    )
+    assert json.loads(imported["body"])["new_name"] == "Library Whisper"
 
 
 def test_changing_one_voice_does_not_affect_others(
@@ -786,6 +1125,80 @@ def test_plan_rejects_long_mid_paragraph_silence(
     response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
     assert response.status_code == 200, response.text
     assert "unnecessary long silence" in fake.calls[1]["user"]
+
+
+def test_plan_prompt_lists_the_closed_vocabularies() -> None:
+    """MiMo cannot obey an enum it never sees (live bug: it invented styles).
+
+    Every allowed emotion and delivery style must appear in the prompt.
+    """
+    from app.schemas.narration import DELIVERY_STYLES, EMOTIONS
+    from app.services.multi_voice_planner import SYSTEM_PROMPT
+
+    for value in (*EMOTIONS, *DELIVERY_STYLES):
+        assert value in SYSTEM_PROMPT, f"{value!r} missing from the prompt"
+    assert "closed lists" in SYSTEM_PROMPT
+
+
+def test_plan_alias_values_are_normalized_not_rejected(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safe morphological variants fold onto the enums instead of failing.
+
+    Live bug: free-text values like 'Soft'/'conversation'/'sad' failed
+    Pydantic's Literal check on all 3 attempts and the whole generation
+    failed after casting approval.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+
+    aliased = make_multi_voice_plan_dict()
+    aliased["utterances"][0]["delivery_style"] = "Conversation"
+    aliased["utterances"][1]["emotion"] = "sad"
+    aliased["utterances"][1]["delivery_style"] = "Softly"
+    aliased["utterances"][2]["emotion"] = "Excited"
+    fake = FakeMiMo([json.dumps(aliased, ensure_ascii=False)])
+    _use_planner(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 1  # normalized on the first try — no rejection
+
+    utterances = response.json()["utterances"]
+    assert utterances[0]["delivery_style"] == "conversational"
+    assert utterances[1]["emotion"] == "sadness"
+    assert utterances[1]["delivery_style"] == "soft"
+    assert utterances[2]["emotion"] == "excitement"
+
+
+def test_plan_unknown_style_is_rejected_with_actionable_feedback(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown values are never guessed at — and the retry names them.
+
+    'cinematic' is a preset name, not a delivery style: it must stay exactly
+    as returned, be rejected loudly, and the feedback must show MiMo the
+    actual value plus the complete accepted list.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+
+    bad = make_multi_voice_plan_dict()
+    bad["utterances"][0]["delivery_style"] = "cinematic"
+    bad["utterances"][0]["emotion"] = "tense"  # semantic guess -> rejected too
+    fake = FakeMiMo([
+        json.dumps(bad, ensure_ascii=False),
+        multi_voice_plan_json(),
+    ])
+    _use_planner(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 2
+
+    feedback = fake.calls[1]["user"]
+    assert "'cinematic'" in feedback  # the ACTUAL value MiMo wrote
+    assert "'tense'" in feedback
+    assert "Allowed values:" in feedback  # the complete closed list
+    assert "Regenerate ONLY 'delivery_style'" in feedback
 
 
 def test_plan_validator_detects_out_of_order_utterances() -> None:
