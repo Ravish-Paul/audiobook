@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.casting import NARRATOR_ID
 from app.schemas.narration import DeliveryStyle, Emotion
+from app.schemas.story_analysis import StoryDirectorAnalysis
 
 # NOTE: `app.services.audio_tags` is imported lazily inside the validator —
 # importing it at module level would pull in the `app.services` package
@@ -61,6 +62,9 @@ class Utterance(BaseModel):
         description="Director's note — metadata, never spoken.",
     )
     pause_after_ms: int = Field(ge=0, le=3000)
+    scene_id: Optional[str] = Field(default=None, max_length=120)
+    scene_purpose: Optional[str] = Field(default=None, max_length=300)
+    pacing: Optional[str] = Field(default=None, max_length=200)
     voice_id: Optional[str] = Field(
         default=None,
         description="Filled from the locked cast (authoritative at generation).",
@@ -94,6 +98,8 @@ class MultiVoicePlan(BaseModel):
     language: str = Field(min_length=1, max_length=60)
     overall_tone: str = Field(default="", max_length=200)
     utterances: list[Utterance] = Field(min_length=1)
+    story_analysis: Optional[StoryDirectorAnalysis] = None
+    effective_profile: Optional[str] = Field(default=None, max_length=40)
 
 
 class MultiVoicePlanResponse(BaseModel):

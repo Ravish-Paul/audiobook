@@ -23,6 +23,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.narration_preferences import NarrationPreferences
+from app.schemas.story_analysis import StoryDirectorAnalysis
 
 # NOTE: `app.services.audio_tags` is imported lazily inside the validator —
 # importing it at module level would pull in the `app.services` package
@@ -43,6 +44,18 @@ Emotion = Literal[
     "anger",
     "confidence",
     "tenderness",
+    # Scene-aware additions (additive: every old value stays valid).
+    "playful",
+    "intimate",
+    "nervous",
+    "suspicious",
+    "tense",
+    "grieving",
+    "reflective",
+    "urgent",
+    "relieved",
+    "hopeful",
+    "vulnerable",
 ]
 
 DeliveryStyle = Literal[
@@ -69,6 +82,17 @@ EMOTIONS: tuple[str, ...] = (
     "anger",
     "confidence",
     "tenderness",
+    "playful",
+    "intimate",
+    "nervous",
+    "suspicious",
+    "tense",
+    "grieving",
+    "reflective",
+    "urgent",
+    "relieved",
+    "hopeful",
+    "vulnerable",
 )
 
 DELIVERY_STYLES: tuple[str, ...] = (
@@ -153,6 +177,22 @@ class ParagraphPlan(BaseModel):
     pause_after_ms: int = Field(
         ge=0, le=3000, description="Silence inserted after this paragraph."
     )
+    # Optional scene metadata (additive): older saved plans simply omit it.
+    scene_id: Optional[str] = Field(
+        default=None,
+        max_length=120,
+        description="Scene/beat identifier assigned by the director.",
+    )
+    scene_purpose: Optional[str] = Field(
+        default=None,
+        max_length=300,
+        description="What this paragraph does in the scene (context, reveal…).",
+    )
+    pacing: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description="Pacing intention, e.g. unhurried, building, clipped.",
+    )
 
     @model_validator(mode="after")
     def _validate_tts_text(self) -> "ParagraphPlan":
@@ -184,6 +224,23 @@ class NarrationPlan(BaseModel):
     language: str = Field(min_length=1, max_length=60)
     paragraphs: list[ParagraphPlan] = Field(min_length=1)
     preferences: Optional[NarrationPreferences] = None
+    story_analysis: Optional[StoryDirectorAnalysis] = Field(
+        default=None,
+        description=(
+            "Whole-story analysis this plan was directed with (None for "
+            "plans built before the Narration Director upgrade). It is "
+            "guidance, not a per-paragraph instruction."
+        ),
+    )
+    effective_profile: Optional[str] = Field(
+        default=None,
+        max_length=40,
+        description=(
+            "The concrete profile the director actually followed. In `auto` "
+            "mode this is the profile recommended by the story analysis; "
+            "otherwise it equals `preferences.preset`."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +336,14 @@ class NarrationPlanResponse(BaseModel):
         default=None,
         description="Preferences this plan was built with (None = not set).",
     )
+    story_analysis: Optional[StoryDirectorAnalysis] = Field(
+        default=None,
+        description="Whole-story analysis used to direct this plan.",
+    )
+    effective_profile: Optional[str] = Field(
+        default=None,
+        description="Concrete profile actually followed (resolved for `auto`).",
+    )
     voice_model: VoiceModelInfo = Field(
         description="Capabilities of the configured TTS model (what is sent)."
     )
@@ -306,6 +371,8 @@ class NarrationPlanResponse(BaseModel):
             paragraph_count=len(plan.paragraphs),
             paragraphs=plan.paragraphs,
             preferences=plan.preferences,
+            story_analysis=plan.story_analysis,
+            effective_profile=plan.effective_profile,
             voice_model=voice_model,
             tts_voice_settings=tts_voice_settings,
             saved=saved,

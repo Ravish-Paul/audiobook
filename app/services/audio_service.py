@@ -81,8 +81,16 @@ def plan_hash(plan: Any) -> str:
     would silently re-bill its finished segments after this upgrade).
     """
     data = plan.model_dump(mode="json")
-    if isinstance(data, dict) and data.get("preferences") is None:
-        data.pop("preferences", None)
+    if isinstance(data, dict):
+        # Legacy plans (and plans built without these optional inputs) must
+        # keep their exact old hash, otherwise finished segments would be
+        # silently re-billed after the Narration Director upgrade.
+        if data.get("preferences") is None:
+            data.pop("preferences", None)
+        if data.get("story_analysis") is None:
+            data.pop("story_analysis", None)
+        if data.get("effective_profile") is None:
+            data.pop("effective_profile", None)
     payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -247,6 +255,20 @@ class AudioService:
         if plan.preferences != current_preferences:
             raise StaleNarrationPreferencesError(project_id)
 
+        # The story analysis is a generation-relevant input too: a fresh
+        # analysis (or a removed one) invalidates a plan directed with the old
+        # one. Plans built before the upgrade carry `story_analysis=None`.
+        stored_analysis = self.projects.get_story_analysis(project_id)
+        current_analysis = stored_analysis[0] if stored_analysis else None
+        if plan.story_analysis != current_analysis:
+            raise StaleNarrationPlanError(
+                project_id,
+                [
+                    "the whole-story analysis changed after this plan was "
+                    "directed — re-run POST /projects/{id}/analyze-narration"
+                ],
+            )
+
         ordered = sorted(plan.paragraphs, key=lambda p: p.paragraph_index)
         max_chars = self.settings.elevenlabs_max_chars
         for paragraph in ordered:
@@ -381,9 +403,20 @@ class AudioService:
         return prior
 
     @staticmethod
-    def _usable_request_id(record: Optional[dict[str, Any]], model_id: str) -> Optional[str]:
-        """A stored request ID that is fresh, from the same model and real."""
+    def _usable_request_id(
+        record: Optional[dict[str, Any]],
+        model_id: str,
+        voice_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """A stored request ID that is fresh, from the same model and real.
+
+        When `voice_id` is given (multi-voice), the record must also have been
+        generated in THAT exact locked voice — a request ID from another
+        voice would teach the model the wrong speaker.
+        """
         if not record or record.get("status") != "generated":
+            return None
+        if voice_id is not None and record.get("voice_id") != voice_id:
             return None
         request_id = record.get("request_id")
         if not isinstance(request_id, str) or not request_id.strip():
@@ -533,6 +566,14 @@ class AudioService:
             if lock is not None:
                 locked_voices[speaker.character_id] = lock.voice_id
 
+        # Dual check (spec §6/§7): every utterance must map to ITS speaker's
+        # locked voice BEFORE the first provider call — a missing or swapped
+        # assignment must never reach ElevenLabs (and never bill a partial
+        # book before failing).
+        for utterance in ordered:
+            if utterance.speaker_id not in locked_voices:
+                raise VoiceNotAssignedError(utterance.speaker_id)
+
         language_code = self._cast_language_code(cast)
         current_hash = plan_hash(plan)
         existing = self.projects.read_audio_metadata(project_id) or {}
@@ -567,6 +608,7 @@ class AudioService:
                 ordered=ordered,
                 prior_records=prior,
                 using_prior_ids=bool(prior),
+                voice_id=voice_id,
             )
             record = await self._ensure_utterance(
                 project_id,
@@ -696,37 +738,71 @@ class AudioService:
         ordered: list[Utterance],
         prior_records: dict[str, dict[str, Any]],
         using_prior_ids: bool,
+        voice_id: Optional[str] = None,
     ) -> Optional[SynthesisContext]:
-        """Neighbouring-utterance context — text first-time, IDs on regeneration."""
+        """Neighbouring-utterance context — SAME SPEAKER ONLY.
+
+        Text first-time, request IDs on regeneration — but both sides only
+        ever come from the SAME speaker as the utterance being generated
+        (and stored IDs must additionally match its locked voice). Another
+        speaker's text or audio as "context" makes the provider bleed one
+        voice's delivery into another's — the live bug where the narrator's
+        lines came back spoken by a character.
+        """
         model_id = self.settings.elevenlabs_model_id
+        speaker = ordered[position].speaker_id
 
         previous_text: Optional[str] = None
         next_text: Optional[str] = None
         previous_ids: list[str] = []
         next_ids: list[str] = []
 
-        if position > 0:
-            previous_text = self._spoken(ordered[position - 1])
-        if position < len(ordered) - 1:
-            next_text = self._spoken(ordered[position + 1])
+        previous_index = next(
+            (
+                index
+                for index in range(position - 1, -1, -1)
+                if ordered[index].speaker_id == speaker
+            ),
+            None,
+        )
+        next_index = next(
+            (
+                index
+                for index in range(position + 1, len(ordered))
+                if ordered[index].speaker_id == speaker
+            ),
+            None,
+        )
+        if previous_index is not None:
+            previous_text = self._spoken(ordered[previous_index])
+        if next_index is not None:
+            next_text = self._spoken(ordered[next_index])
 
         if using_prior_ids:
-            for offset in range(1, 4):
-                neighbour = position - offset
-                if neighbour < 0:
+            for index in range(position - 1, -1, -1):
+                if len(previous_ids) >= 3:
                     break
-                record = prior_records.get(ordered[neighbour].utterance_id)
-                request_id = self._usable_request_id(record, model_id)
+                neighbour = ordered[index]
+                if neighbour.speaker_id != speaker:
+                    continue
+                record = prior_records.get(neighbour.utterance_id)
+                request_id = self._usable_request_id(
+                    record, model_id, voice_id=voice_id
+                )
                 if request_id:
                     previous_ids.append(request_id)
             previous_ids.reverse()
 
-            for offset in range(1, 4):
-                neighbour = position + offset
-                if neighbour >= len(ordered):
+            for index in range(position + 1, len(ordered)):
+                if len(next_ids) >= 3:
                     break
-                record = prior_records.get(ordered[neighbour].utterance_id)
-                request_id = self._usable_request_id(record, model_id)
+                neighbour = ordered[index]
+                if neighbour.speaker_id != speaker:
+                    continue
+                record = prior_records.get(neighbour.utterance_id)
+                request_id = self._usable_request_id(
+                    record, model_id, voice_id=voice_id
+                )
                 if request_id:
                     next_ids.append(request_id)
 

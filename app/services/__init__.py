@@ -97,6 +97,7 @@ from app.services.narration_planner import (
 from app.services.narration_policy import NarrationPolicyValidator
 from app.services.project_service import ProjectService
 from app.services.pyannote_client import PyannoteClient
+from app.services.story_analysis_service import StoryAnalysisService
 from app.services.voice_casting_service import VoiceCastingService
 from app.services.voice_discovery import (
     ElevenLabsVoiceDiscovery,
@@ -176,6 +177,7 @@ __all__ = [
     "StaleNarrationPreferencesError",
     "SynthesisContext",
     "SynthesisResult",
+    "StoryAnalysisService",
     "UtteranceGenerationError",
     "VoiceCastingService",
     "VoiceDetailsNotFoundError",

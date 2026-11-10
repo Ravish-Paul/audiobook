@@ -33,6 +33,7 @@ from app import security as security_mod
 from app.config import DEFAULT_ELEVENLABS_BASE_URL, get_settings
 from app.main import app
 from app.routes import audio as audio_routes
+from app.routes import casting as casting_routes
 from app.services import AudioService, ElevenLabsClient
 from fakes import FAKE_MP3, FakeComposer
 
@@ -419,6 +420,47 @@ def test_in_flight_generation_is_rejected_and_failures_can_be_retried() -> None:
     assert recent is not None and "Duplicate submission" in recent
     # A different project is unaffected.
     assert security_mod._duplicate_begin("alice:/projects/q/generate-audio", 10) is None
+
+
+def test_the_duplicate_window_compares_the_whole_submission(
+    client: TestClient, beta_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching a voice preview must work immediately (live bug: previewing
+    a second voice within the window got a 409 "Duplicate submission"), while
+    an identical double submission is still refused."""
+    _reset_beta_state()
+    project = _create_project(client, ALICE)
+
+    class _StubCasting:
+        async def audition(self, project_id: str, payload) -> bytes:  # noqa: ANN001
+            return b"fake-audio-bytes"
+
+    monkeypatch.setattr(casting_routes, "_casting_service", lambda: _StubCasting())
+    url = f"/projects/{project}/voice-casting/audition"
+
+    first = client.post(
+        url,
+        json={"speaker_id": "narrator", "voice_id": "voice-a", "text": "Hello there."},
+        headers=ALICE,
+    )
+    assert first.status_code == 200, first.text
+
+    # Another voice right away = a DIFFERENT submission — never blocked.
+    second = client.post(
+        url,
+        json={"speaker_id": "narrator", "voice_id": "voice-b", "text": "Hello there."},
+        headers=ALICE,
+    )
+    assert second.status_code == 200, second.text
+
+    # The exact same submission again = a real duplicate — still refused.
+    third = client.post(
+        url,
+        json={"speaker_id": "narrator", "voice_id": "voice-a", "text": "Hello there."},
+        headers=ALICE,
+    )
+    assert third.status_code == 409
+    assert "duplicate" in third.json()["detail"].lower()
 
 
 def test_api_rate_limiting(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

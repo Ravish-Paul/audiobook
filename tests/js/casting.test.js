@@ -1091,8 +1091,8 @@ async function check(name, fn) {
     );
   });
 
-  /* 11 — duplicate analysis and audition submissions are prevented */
-  await check("duplicate analysis and audition requests are prevented", async () => {
+  /* 11 — duplicate submissions are prevented, but switching previews is not */
+  await check("duplicates are prevented while switching voice previews always works", async () => {
     const casting = makeCasting("p1");
     const gate = deferred();
     const app = await boot({
@@ -1131,54 +1131,78 @@ async function check(name, fn) {
       "the finished analysis is reused, not re-run"
     );
 
-    // An audition blocks every other audition while it is running…
-    const pendingAudition = deferred();
+    // --- previews: duplicates are refused, switching is never blocked --- //
+    const gates = [];
     app.fetchCalls.length = 0;
-    // Route auditions through a gate by wrapping fetch for this part only.
     const realFetch = global.fetch;
     global.fetch = async (url, options = {}) => {
       if (String(url).endsWith("/voice-casting/audition") && options.method === "POST") {
         app.fetchCalls.push({ url, method: "POST", body: JSON.parse(options.body) });
-        await pendingAudition.promise;
+        const auditionGate = deferred();
+        gates.push(auditionGate);
+        await auditionGate.promise;
         return makeResponse({ status: 200 });
       }
       return realFetch(url, options);
     };
+    const auditionCalls = () =>
+      app.fetchCalls.filter((c) => String(c.url).endsWith("/voice-casting/audition"));
+
+    // The SAME preview twice while it is loading -> one submission only.
     fire(app.element("cast-cards"), "click", {
       target: { dataset: { action: "audition", speaker: "narrator" } },
     });
     fire(app.element("cast-cards"), "click", {
-      target: { dataset: { action: "audition", speaker: "suman" } },
+      target: { dataset: { action: "audition", speaker: "narrator" } },
     });
     await flush();
-    assert.strictEqual(
-      app.fetchCalls.filter((c) => String(c.url).endsWith("/voice-casting/audition")).length,
-      1,
-      "only one audition runs at a time"
-    );
+    assert.strictEqual(auditionCalls().length, 1, "the same preview is never submitted twice");
     assert.ok(
       app.element("status").textContent.includes("already being generated"),
       app.element("status").textContent
     );
-    pendingAudition.resolve({});
-    await flush();
-    assert.strictEqual(app.audio().length, 1);
 
-    // …and a successful preview starts a short cooldown for the next one.
+    // …but switching to ANOTHER voice mid-load works immediately.
     fire(app.element("cast-cards"), "click", {
       target: { dataset: { action: "audition", speaker: "suman" } },
     });
     await flush();
-    assert.strictEqual(
-      app.fetchCalls.filter((c) => String(c.url).endsWith("/voice-casting/audition")).length,
-      1,
-      "the cooldown prevents an immediate duplicate submission"
-    );
+    assert.strictEqual(auditionCalls().length, 2, "switching voices is never blocked");
+    assert.strictEqual(auditionCalls()[0].body.voice_id, "voice-narrator-01");
+    assert.strictEqual(auditionCalls()[1].body.voice_id, "voice-suman-02");
+
+    // The superseded fetch never plays; only the newest preview does.
+    gates[1].resolve({});
+    await flush();
+    gates[0].resolve({});
+    await flush();
+    assert.strictEqual(app.audio().length, 1, "only the newest preview plays");
+
+    // The preview ends -> re-previewing the SAME voice right away waits
+    // (the backend would answer 409) …
+    const played = app.audio()[0];
+    played.onended();
+    await flush();
+    fire(app.element("cast-cards"), "click", {
+      target: { dataset: { action: "audition", speaker: "suman" } },
+    });
+    await flush();
+    assert.strictEqual(auditionCalls().length, 2, "the cooldown stops a duplicate submission");
     assert.ok(
       app.element("status").textContent.includes("wait a moment"),
       app.element("status").textContent
     );
-    assert.strictEqual(app.audio().length, 1, "no second preview was generated");
+
+    // …while another voice is a DIFFERENT submission and starts instantly.
+    fire(app.element("cast-cards"), "click", {
+      target: { dataset: { action: "audition", speaker: "narrator" } },
+    });
+    await flush();
+    assert.strictEqual(auditionCalls().length, 3, "switching to another voice is never blocked");
+    gates[2].resolve({});
+    await flush();
+    assert.strictEqual(app.audio().length, 2, "the switched preview plays at once");
+    global.fetch = realFetch;
   });
 
   /* 12 — analysis and audition work at zero allowance */
@@ -1285,12 +1309,27 @@ async function check(name, fn) {
     assert.strictEqual(app.calls("POST", "/projects/p1/create-multi-voice-plan").length, 1);
     assert.strictEqual(app.calls("POST", "/projects/p1/generate-audio").length, 1);
 
-    // Regenerating reuses the saved plan (no second planning call/spend).
+    // The mood mode drives the saved preferences: AI-automatic is the
+    // default ("auto" preset — the model picks each paragraph's mood).
+    const moodCalls = app.calls("PUT", "/projects/p1/narration-preferences");
+    assert.ok(moodCalls.length >= 1, "preferences are saved before planning");
+    assert.strictEqual(moodCalls[0].body.preset, "auto", "AI-automatic mood by default");
+
+    // Regenerating reuses the saved plan (no second planning call/spend) —
+    // and switching to a MANUAL mood saves the chosen style instead.
+    fire(app.element("mood-mode-manual"), "change", {});
     fire(app.element("btn-regenerate"), "click", {});
     await flush();
     assert.strictEqual(app.calls("POST", "/projects/p1/create-multi-voice-plan").length, 1);
     assert.strictEqual(app.calls("POST", "/projects/p1/generate-audio").length, 2);
     assert.strictEqual(app.calls("POST", "/projects/p1/analyze-narration").length, 0);
+    const moodCallsAfter = app.calls("PUT", "/projects/p1/narration-preferences");
+    assert.ok(moodCallsAfter.length > moodCalls.length, "manual mode saves its own preferences");
+    assert.strictEqual(
+      moodCallsAfter[moodCallsAfter.length - 1].body.preset,
+      "natural",
+      "manual mode sends the chosen style card"
+    );
 
     // Honest failure: if the backend did NOT use the character voices, say so
     // and drop the plan key so the next attempt rebuilds the plan.

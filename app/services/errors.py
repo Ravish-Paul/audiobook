@@ -292,6 +292,35 @@ class ParagraphPreviewError(ProjectError):
         )
 
 
+class StoryAnalysisNotFoundError(ProjectError):
+    """No whole-story analysis exists yet for this project."""
+
+    status_code = 404
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+        super().__init__(
+            f"No story analysis for project '{project_id}' yet — run "
+            f"POST /projects/{project_id}/analyze-story first"
+        )
+
+
+class StoryAnalysisError(ProjectError):
+    """MiMo returned a story analysis that failed validation after retries."""
+
+    status_code = 502
+
+    def __init__(self, problems: list[str], attempts: int) -> None:
+        self.problems = problems
+        self.attempts = attempts
+        preview = " | ".join(problems[:6])
+        more = "" if len(problems) <= 6 else f" (+{len(problems) - 6} more)"
+        super().__init__(
+            f"MiMo returned an invalid story analysis after {attempts} "
+            f"attempt(s): {preview}{more}"
+        )
+
+
 class SegmentGenerationError(ProjectError):
     """One paragraph failed to synthesise; finished segments are preserved."""
 

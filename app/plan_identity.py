@@ -54,7 +54,7 @@ PLAN_STATE_FILENAME = "multi_voice_plan_state.json"
 
 # Bump when the hashed inputs change shape — old fingerprints then simply
 # stop matching instead of being compared against a different algorithm.
-FINGERPRINT_VERSION = "v1"
+FINGERPRINT_VERSION = "v2"
 
 # Statuses whose workflow is still unfinished and therefore recoverable.
 REUSABLE_STATUSES = ("ready", "started")
@@ -172,11 +172,19 @@ def compute_fingerprint(settings: Settings, project_id: str) -> Optional[str]:
         elif payload is not None:
             preferences = payload
 
+    analysis_path = directory / settings.story_analysis_filename
+    story_analysis: Any = None
+    if analysis_path.is_file():
+        stored = _read_json(analysis_path)
+        if isinstance(stored, dict):
+            story_analysis = stored.get("analysis", stored)
+
     payload = {
         "version": FINGERPRINT_VERSION,
         "script": _sha256(script_text),
         "cast": cast_identity(cast),
         "preferences": preferences,
+        "story_analysis": story_analysis,
     }
     return f"{FINGERPRINT_VERSION}:{_sha256(_canonical_json(payload))}"
 

@@ -45,32 +45,34 @@ BROWSER_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.
 UNKNOWN_ID = "00000000-0000-0000-0000-000000000000"
 
 # The EXACT mapping app.js uses (STYLE_PRESETS) — asserted both ways below.
+def _preset(preset, acting_intensity, whisper_policy, tag_density):
+    return {
+        "preset": preset,
+        "acting_intensity": acting_intensity,
+        "whisper_policy": whisper_policy,
+        "whisper_paragraphs": [],
+        "tag_density": tag_density,
+        "custom_direction": "",
+    }
+
+
 STYLE_PRESETS = {
-    "natural": {
-        "preset": "natural",
-        "acting_intensity": 2,
-        "whisper_policy": "never",
-        "whisper_paragraphs": [],
-        "tag_density": "minimal",
-        "custom_direction": "",
-    },
-    "cinematic": {
-        "preset": "restrained_cinematic",
-        "acting_intensity": 2,
-        "whisper_policy": "user_selected",
-        "whisper_paragraphs": [],
-        "tag_density": "minimal",
-        "custom_direction": "",
-    },
-    "expressive": {
-        "preset": "expressive",
-        "acting_intensity": 3,
-        "whisper_policy": "user_selected",
-        "whisper_paragraphs": [],
-        "tag_density": "standard",
-        "custom_direction": "",
-    },
+    "natural": _preset("natural", 2, "never", "minimal"),
+    "cinematic": _preset("cinematic", 2, "user_selected", "minimal"),
+    "horror": _preset("horror", 3, "user_selected", "standard"),
+    "romantic": _preset("romantic", 2, "user_selected", "minimal"),
+    "sensual": _preset("sensual", 2, "user_selected", "standard"),
+    "emotional": _preset("emotional", 2, "user_selected", "minimal"),
+    "action": _preset("action", 4, "never", "standard"),
+    "mystery": _preset("mystery", 2, "user_selected", "minimal"),
+    "fantasy": _preset("fantasy", 3, "user_selected", "standard"),
+    "comedy": _preset("comedy", 3, "never", "standard"),
+    "professional": _preset("professional", 1, "never", "minimal"),
+    "children": _preset("children", 3, "never", "standard"),
 }
+
+# The "AI Automatic" mood-mode mapping (app.js AUTO_MOOD).
+AUTO_MOOD = _preset("auto", 3, "user_selected", "standard")
 
 
 @pytest.fixture()
@@ -229,12 +231,48 @@ def test_ui_is_the_simple_creator(client: TestClient) -> None:
     for element_id in ("book-title", "language-name", "paragraph-count", "script-preview"):
         assert f'id="{element_id}"' in html, element_id
 
-    # Three style cards only
-    for style_id in ("style-natural", "style-cinematic", "style-expressive"):
-        assert f'id="{style_id}"' in html, style_id
-    assert "Clear, conversational, realistic narration." in html
-    assert "Immersive and emotionally controlled storytelling." in html
-    assert "More emotional variation when the story requires it." in html
+    # The twelve global narration profile cards.
+    profile_ids = (
+        "natural",
+        "cinematic",
+        "horror",
+        "romantic",
+        "sensual",
+        "emotional",
+        "action",
+        "mystery",
+        "fantasy",
+        "comedy",
+        "professional",
+        "children",
+    )
+    for profile_id in profile_ids:
+        assert f'id="style-{profile_id}"' in html, profile_id
+    assert "Clear, conversational and realistic storytelling." in html
+    assert "Atmospheric, immersive and dramatically controlled." in html
+    assert "Gradual tension, unease and suspense." in html
+
+    # Mood mode (AI Automatic / Manual) + the analysis panel + preview player
+    for element_id in (
+        "mood-modes",
+        "mood-mode-auto",
+        "mood-mode-manual",
+        "mood-auto-hint",
+        "btn-analyze-story",
+        "btn-use-recommended",
+        "story-analysis-panel",
+        "analysis-genre",
+        "analysis-profile",
+        "analysis-mood",
+        "analysis-direction",
+        "analysis-scenes",
+        "btn-narration-preview",
+        "preview-player",
+    ):
+        assert f'id="{element_id}"' in html, element_id
+    assert "Let AI choose based on my story" in html
+    assert "I&rsquo;ll choose the mood" in html
+    assert "Close, subtle intimacy only where the scene allows it." in html
 
     # ONE main action + result screen
     assert "Generate Audiobook" in html
@@ -287,33 +325,59 @@ def test_responsive_and_accessible_markup(client: TestClient) -> None:
 # Narration presets -> NarrationPreferences
 # --------------------------------------------------------------------------- #
 def test_style_preset_mappings_are_the_documented_ones() -> None:
-    assert STYLE_PRESETS["natural"] == {
-        "preset": "natural",
-        "acting_intensity": 2,
-        "whisper_policy": "never",
-        "whisper_paragraphs": [],
-        "tag_density": "minimal",
-        "custom_direction": "",
+    # Exactly the twelve profiles are exposed (plus automatic mode separately).
+    assert set(STYLE_PRESETS) == {
+        "natural",
+        "cinematic",
+        "horror",
+        "romantic",
+        "sensual",
+        "emotional",
+        "action",
+        "mystery",
+        "fantasy",
+        "comedy",
+        "professional",
+        "children",
     }
-    assert STYLE_PRESETS["cinematic"] == {
-        "preset": "restrained_cinematic",
-        "acting_intensity": 2,
-        "whisper_policy": "user_selected",
-        "whisper_paragraphs": [],
-        "tag_density": "minimal",
-        "custom_direction": "",
-    }
-    assert STYLE_PRESETS["expressive"] == {
-        "preset": "expressive",
-        "acting_intensity": 3,
-        "whisper_policy": "user_selected",
-        "whisper_paragraphs": [],
-        "tag_density": "standard",
-        "custom_direction": "",
-    }
+    assert STYLE_PRESETS["natural"] == _preset("natural", 2, "never", "minimal")
+    assert STYLE_PRESETS["cinematic"] == _preset(
+        "cinematic", 2, "user_selected", "minimal"
+    )
+    assert STYLE_PRESETS["horror"] == _preset("horror", 3, "user_selected", "standard")
+    assert STYLE_PRESETS["romantic"] == _preset(
+        "romantic", 2, "user_selected", "minimal"
+    )
+    # The intimate profiles forbid unsolicited whispering.
+    for profile in ("romantic", "sensual"):
+        assert STYLE_PRESETS[profile]["whisper_paragraphs"] == []
+        assert STYLE_PRESETS[profile]["whisper_policy"] != "rare"
+    assert STYLE_PRESETS["sensual"] == _preset(
+        "sensual", 2, "user_selected", "standard"
+    )
+    assert STYLE_PRESETS["professional"] == _preset(
+        "professional", 1, "never", "minimal"
+    )
+    assert AUTO_MOOD == _preset("auto", 3, "user_selected", "standard")
 
 
-@pytest.mark.parametrize("style", ["natural", "cinematic", "expressive"])
+@pytest.mark.parametrize(
+    "style",
+    [
+        "natural",
+        "cinematic",
+        "horror",
+        "romantic",
+        "sensual",
+        "emotional",
+        "action",
+        "mystery",
+        "fantasy",
+        "comedy",
+        "professional",
+        "children",
+    ],
+)
 def test_style_presets_are_valid_and_persisted(client: TestClient, style: str) -> None:
     project_id = _import(client).json()["project_id"]
     preferences = STYLE_PRESETS[style]
@@ -330,22 +394,67 @@ def test_style_presets_are_valid_and_persisted(client: TestClient, style: str) -
     assert loaded["preferences"] == preferences
 
 
+@pytest.mark.parametrize(
+    "legacy",
+    ["restrained_cinematic", "expressive", "dramatic", "soft", "smooth"],
+)
+def test_legacy_presets_still_round_trip(client: TestClient, legacy: str) -> None:
+    """Old saved plans/localStorage must keep working after the upgrade."""
+    project_id = _import(client).json()["project_id"]
+    preferences = _preset(legacy, 2, "user_selected", "minimal")
+    saved = client.put(
+        f"/projects/{project_id}/narration-preferences", json=preferences
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["preferences"]["preset"] == legacy
+
+
 def test_app_js_maps_the_same_presets(client: TestClient) -> None:
     js = client.get("/static/app.js").text
 
     for snippet in (
         "STYLE_PRESETS",
-        'preset: "natural"',
-        'preset: "restrained_cinematic"',
-        'preset: "expressive"',
-        'whisper_policy: "never"',
-        'whisper_policy: "user_selected"',
-        "acting_intensity: 2",
-        "acting_intensity: 3",
-        'tag_density: "minimal"',
-        'tag_density: "standard"',
+        "AUTO_MOOD",
+        "LEGACY_STYLE_ALIASES",
+        "normalizeStyleId",
+        "moodMode",
+        "presetPreferences",
+        '"natural"',
+        '"cinematic"',
+        '"horror"',
+        '"romantic"',
+        '"sensual"',
+        '"emotional"',
+        '"action"',
+        '"mystery"',
+        '"fantasy"',
+        '"comedy"',
+        '"professional"',
+        '"children"',
+        '"auto"',
+        'whisper_policy',
+        "acting_intensity",
+        "tag_density",
     ):
         assert snippet in js, snippet
+    # The old six-card vocabulary is gone from the selectable presets.
+    assert "preset: \"restrained_cinematic\"" not in js
+    assert '"expressive": {' not in js
+
+
+def test_ai_automatic_mood_is_valid_and_persisted(client: TestClient) -> None:
+    """The "AI Automatic" mood mode round-trips through the API as `auto`."""
+    project_id = _import(client).json()["project_id"]
+
+    saved = client.put(
+        f"/projects/{project_id}/narration-preferences", json=AUTO_MOOD
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["preferences"] == AUTO_MOOD
+
+    loaded = client.get(f"/projects/{project_id}/narration-preferences").json()
+    assert loaded["preferences"] == AUTO_MOOD
+    assert loaded["preferences"]["preset"] == "auto"
 
 
 # --------------------------------------------------------------------------- #

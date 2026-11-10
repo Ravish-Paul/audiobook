@@ -60,8 +60,9 @@ from app.services.voice_matcher import (
     rank_candidates,
 )
 
-# How many acceptable candidates we try to present per speaker.
-CANDIDATES_PER_SPEAKER = 3
+# How many acceptable candidates we try to present per speaker — enough
+# choices to find the right voice for the story, still ranked best-first.
+CANDIDATES_PER_SPEAKER = 10
 
 
 def _utcnow() -> datetime:

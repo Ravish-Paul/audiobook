@@ -483,6 +483,7 @@ class Settings:
     # ---- Narration plan + audio composition ------------------------------ #
     narration_plan_filename: str = "narration_plan.json"
     narration_preferences_filename: str = "narration_preferences.json"
+    story_analysis_filename: str = "story_analysis.json"
     character_cast_filename: str = "character_cast.json"
     multi_voice_plan_filename: str = "multi_voice_plan.json"
     segment_dir_name: str = "segments"

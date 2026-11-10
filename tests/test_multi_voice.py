@@ -34,6 +34,7 @@ from app.services import (
 )
 from app.services.multi_voice_planner import validate_plan_against_script
 from fakes import (
+    director_analysis_json,
     FAKE_MP3,
     FakeComposer,
     FakeMiMo,
@@ -488,15 +489,16 @@ def test_voice_casting_builds_top_candidates_per_speaker(
     assert response.status_code == 200, response.text
     body = response.json()
 
-    # Account voices first — the library was not needed for this pool …
+    # Account voices first — every candidate of this pool is an account
+    # voice (the library only tops thin pools up and adds nothing here) …
     assert "/v2/voices" in mock.paths
-    assert "/v1/shared-voices" not in mock.paths
 
     for entry in (body["narrator"], *body["characters"].values()):
-        assert 1 <= len(entry["candidates"]) <= 3
+        assert 1 <= len(entry["candidates"]) <= 10  # up to 10 choices per role
         assert entry["insufficient_candidates"] is False
         for candidate in entry["candidates"]:
             assert candidate["voice_id"] in HI_VOICE_IDS  # en + banned excluded
+            assert candidate["origin"] == "account"
             assert candidate["name"]
             assert candidate["preview_url"]               # preview player data
             assert candidate["rank"] >= 1
@@ -1183,7 +1185,7 @@ def test_plan_unknown_style_is_rejected_with_actionable_feedback(
 
     bad = make_multi_voice_plan_dict()
     bad["utterances"][0]["delivery_style"] = "cinematic"
-    bad["utterances"][0]["emotion"] = "tense"  # semantic guess -> rejected too
+    bad["utterances"][0]["emotion"] = "euphoric"  # not an allowed emotion
     fake = FakeMiMo([
         json.dumps(bad, ensure_ascii=False),
         multi_voice_plan_json(),
@@ -1196,9 +1198,97 @@ def test_plan_unknown_style_is_rejected_with_actionable_feedback(
 
     feedback = fake.calls[1]["user"]
     assert "'cinematic'" in feedback  # the ACTUAL value MiMo wrote
-    assert "'tense'" in feedback
+    assert "'euphoric'" in feedback
     assert "Allowed values:" in feedback  # the complete closed list
     assert "Regenerate ONLY 'delivery_style'" in feedback
+
+
+def test_plan_invented_metadata_degrades_on_the_final_attempt(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invented emotion/delivery_style values must not kill the generation.
+
+    Live bug: MiMo kept inventing semantic values ('wistful', 'warm', 'peace')
+    on all 3 attempts and NO audio was generated. Those two fields are
+    metadata only (never sent to TTS), so the final attempt degrades them to
+    safe defaults — after two strict rejections with actionable feedback.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+
+    bad1 = make_multi_voice_plan_dict()
+    bad1["utterances"][0]["emotion"] = "wistful"
+    bad2 = make_multi_voice_plan_dict()
+    bad2["utterances"][1]["delivery_style"] = "warm"
+    bad3 = make_multi_voice_plan_dict()  # the live-bug shape: several at once
+    bad3["utterances"][0]["emotion"] = "wistful"
+    bad3["utterances"][1]["delivery_style"] = "warm"
+    bad3["utterances"][2]["emotion"] = "peace"
+    fake = FakeMiMo([
+        json.dumps(bad1, ensure_ascii=False),
+        json.dumps(bad2, ensure_ascii=False),
+        json.dumps(bad3, ensure_ascii=False),
+    ])
+    _use_planner(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 3
+
+    # Attempts 1-2 still reject STRICTLY and name the offending value.
+    assert "'wistful'" in fake.calls[1]["user"]
+    assert "'warm'" in fake.calls[2]["user"]
+
+    utterances = response.json()["utterances"]
+    # Only the invented values degrade — to the safe defaults.
+    assert utterances[0]["emotion"] == "neutral"
+    assert utterances[1]["delivery_style"] == "calm"
+    assert utterances[2]["emotion"] == "neutral"
+    # Every valid planned value stays exactly as MiMo returned it.
+    assert utterances[0]["delivery_style"] == "calm"
+    assert utterances[1]["emotion"] == "fear"
+    assert utterances[2]["delivery_style"] == "slow"
+
+
+def test_plan_word_changes_are_never_masked_by_metadata_coercion(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Coercion only ever fixes metadata — changed story words still fail."""
+    _analyze(client, monkeypatch, project_with_script)
+
+    bad = make_multi_voice_plan_dict()
+    bad["utterances"][0]["emotion"] = "hope"  # salvageable metadata ...
+    # ... but BOTH texts also lose a word: that must fail loudly.
+    bad["utterances"][1]["original_text"] = "आईने में मत देखना।"
+    bad["utterances"][1]["tts_text"] = "[quiet, tense delivery] आईने में मत देखना।"
+    fake = FakeMiMo([json.dumps(bad, ensure_ascii=False)])
+    _use_planner(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "do not reproduce the original paragraph" in detail
+    assert "no audio was generated" in detail
+    assert fake.call_count == 3
+
+
+def test_plan_non_enum_failures_are_never_coerced(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the metadata enums degrade — a broken structure still fails."""
+    _analyze(client, monkeypatch, project_with_script)
+
+    bad = make_multi_voice_plan_dict()
+    bad["utterances"][0]["emotion"] = "hope"  # salvageable on its own ...
+    bad["utterances"][0]["acting_intensity"] = 99  # ... but this is not
+    fake = FakeMiMo([json.dumps(bad, ensure_ascii=False)])
+    _use_planner(monkeypatch, fake)
+
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "acting_intensity" in detail
+    assert "no audio was generated" in detail
+    assert fake.call_count == 3
 
 
 def test_plan_validator_detects_out_of_order_utterances() -> None:
@@ -1533,3 +1623,494 @@ def test_project_without_multi_voice_plan_keeps_existing_modes(
     paths = {r["path"] for r in mock.tts_requests}
     assert paths == {"/v1/text-to-speech/voice-project-default"}
     assert composer.segment_counts == [len(MV_PARAGRAPHS)]
+
+
+# --------------------------------------------------------------------------- #
+# 13. Ten candidates per speaker (the voice dropdown)
+# --------------------------------------------------------------------------- #
+def test_voice_casting_offers_ten_candidates_for_a_large_pool(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rich pool yields TEN ranked choices per role — the user asked for
+    enough candidates to find the right voice for story, script and language.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    description = (
+        "Deep, calm, measured narrator voice for audiobooks; soft warm "
+        "grounded voice, natural and restrained for stories"
+    )
+    pool = {
+        "voices": [
+            account_voice(
+                f"voice-pool-{index:02d}",
+                name=f"Pool Voice {index:02d}",
+                description=description,
+            )
+            for index in range(14)
+        ],
+        "has_more": False,
+    }
+    _wire_casting(monkeypatch, _default_mock(account_default=pool))
+
+    body = client.post(f"/projects/{project_with_script}/voice-casting").json()
+
+    for entry in (body["narrator"], *body["characters"].values()):
+        candidates = entry["candidates"]
+        assert len(candidates) == 10, "ten voices in the dropdown"
+        ids = [c["voice_id"] for c in candidates]
+        assert len(set(ids)) == 10  # ten DIFFERENT voices
+        scores = [c["total_score"] for c in candidates]
+        assert scores == sorted(scores, reverse=True)  # best first
+        assert [c["rank"] for c in candidates] == list(range(1, 11))
+        for candidate in candidates:
+            assert candidate["voice_id"].startswith("voice-pool-")
+            assert candidate["preview_url"]
+            assert candidate["total_score"] >= 0.55
+
+
+# --------------------------------------------------------------------------- #
+# 14. Narration style drives the multi-voice prompt (tags + mood)
+# --------------------------------------------------------------------------- #
+def test_multi_voice_prompt_follows_the_selected_narration_style(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Natural / Cinematic / Expressive / Soft / … / AI Automatic really
+    change the plan prompt — so the tag and mood differences are audible.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    _wire_casting(monkeypatch)
+    _select_both(client, project_with_script)
+    _approve(client, project_with_script)
+
+    def prompt_for(preferences: dict[str, Any], *, analysis: bool = False) -> str:
+        saved = client.put(
+            f"/projects/{project_with_script}/narration-preferences",
+            json=preferences,
+        )
+        assert saved.status_code == 200, saved.text
+        responses: list[str] = []
+        if analysis:
+            # Automatic mode first runs the whole-story analysis (aux MiMo).
+            responses.append(director_analysis_json())
+        responses.append(multi_voice_plan_json())
+        fake = FakeMiMo(responses)
+        _use_planner(monkeypatch, fake)
+        response = client.post(
+            f"/projects/{project_with_script}/create-multi-voice-plan"
+        )
+        assert response.status_code == 200, response.text
+        assert fake.call_count == len(responses)
+        return fake.calls[-1]["user"]
+
+    expressive = prompt_for({
+        "preset": "cinematic", "acting_intensity": 2,
+        "whisper_policy": "user_selected", "whisper_paragraphs": [],
+        "tag_density": "minimal", "custom_direction": "",
+    })
+    assert "NARRATION PREFERENCES" in expressive
+    assert "Cinematic &amp; Immersive" in expressive or "Cinematic" in expressive
+    assert "at most 1 audio tag(s) per paragraph" in expressive
+
+    natural = prompt_for({
+        "preset": "natural", "acting_intensity": 2,
+        "whisper_policy": "never", "whisper_paragraphs": [],
+        "tag_density": "minimal", "custom_direction": "",
+    })
+    assert "Natural" in natural
+    assert "at most 1 audio tag(s) per paragraph" in natural
+    assert "no whisper or hushed delivery anywhere" in natural
+
+    sensual = prompt_for({
+        "preset": "sensual", "acting_intensity": 2,
+        "whisper_policy": "rare", "whisper_paragraphs": [],
+        "tag_density": "standard", "custom_direction": "",
+    })
+    assert "Sensual" in sensual
+    assert "sensual, intimate, velvety delivery" in sensual
+
+    automatic = prompt_for({
+        "preset": "auto", "acting_intensity": 3,
+        "whisper_policy": "user_selected", "whisper_paragraphs": [],
+        "tag_density": "standard", "custom_direction": "",
+    }, analysis=True)
+    assert "AI Automatic" in automatic
+    assert "AI-automatic mood" in automatic
+    assert "choose each paragraph's mood" in automatic
+
+
+# --------------------------------------------------------------------------- #
+# 15. Voice exchange: context never crosses speakers (the dual check)
+# --------------------------------------------------------------------------- #
+def test_utterance_context_never_crosses_speakers() -> None:
+    """Neighbour context is SAME-SPEAKER ONLY, text and request IDs alike.
+
+    Live bug: `previous_text`/`next_text` and the stored request IDs came
+    from ANY neighbouring utterance, so ElevenLabs bled one voice's delivery
+    into another's — the narrator's lines came back spoken by a character.
+    """
+    from datetime import datetime, timezone
+
+    from app.schemas.multi_voice import Utterance
+
+    service = AudioService(_settings(), composer=FakeComposer())
+    ordered = [
+        Utterance.model_validate(raw)
+        for raw in make_multi_voice_plan_dict()["utterances"]
+    ]  # N S N N S N
+    now = datetime.now(timezone.utc).isoformat()
+
+    def record(voice_id: str, request_id: str) -> dict[str, Any]:
+        return {
+            "status": "generated",
+            "voice_id": voice_id,
+            "model_id": "eleven_v4",
+            "request_id": request_id,
+            "generated_at": now,
+        }
+
+    prior = {
+        "custom-0": record("voice-narrator-01", "req-n0"),
+        "custom-1": record("voice-suman-02", "req-s1"),
+        "custom-2": record("voice-narrator-01", "req-n2"),
+        "custom-3": record("voice-narrator-01", "req-n3"),
+        "custom-4": record("voice-suman-02", "req-s4"),
+        "custom-5": record("voice-narrator-01", "req-n5"),
+    }
+
+    # First-time generation: TEXT context, same speaker only.
+    context = service._build_utterance_context(
+        position=1, ordered=ordered, prior_records={}, using_prior_ids=False,
+        voice_id="voice-suman-02",
+    )
+    assert context is not None
+    assert context.previous_text is None  # custom-0 belongs to the narrator
+    assert context.next_text == service._spoken(ordered[4])  # her own line
+
+    context = service._build_utterance_context(
+        position=0, ordered=ordered, prior_records={}, using_prior_ids=False,
+        voice_id="voice-narrator-01",
+    )
+    assert context is not None
+    assert context.previous_text is None
+    assert context.next_text == service._spoken(ordered[2])  # never custom-1
+
+    # Regeneration: REQUEST IDs, same speaker AND same locked voice only.
+    context = service._build_utterance_context(
+        position=1, ordered=ordered, prior_records=prior, using_prior_ids=True,
+        voice_id="voice-suman-02",
+    )
+    assert context.previous_request_ids == ()  # the narrator's id is excluded
+    assert context.next_request_ids == ("req-s4",)
+
+    # A stored ID generated in a DIFFERENT locked voice is never reused.
+    changed = dict(prior)
+    changed["custom-0"] = record("voice-old-replacement", "req-n0")
+    context = service._build_utterance_context(
+        position=2, ordered=ordered, prior_records=changed, using_prior_ids=True,
+        voice_id="voice-narrator-01",
+    )
+    assert context.previous_request_ids == ()  # voice mismatch -> dropped
+    assert context.previous_text == service._spoken(ordered[0])  # text instead
+
+
+def test_generated_requests_never_carry_another_speakers_context(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wire-level dual check: on the way to ElevenLabs, no request ever
+    contains another speaker's line as its continuity context."""
+    mock = _prepare_generable_project(client, monkeypatch, project_with_script)
+    _wire_audio(monkeypatch, mock)
+
+    response = client.post(f"/projects/{project_with_script}/generate-audio")
+    assert response.status_code == 200, response.text
+
+    spoken_by_voice: dict[str, set[str]] = {
+        NARRATOR_VOICE_ID: set(),
+        SUMAN_VOICE_ID: set(),
+    }
+    for raw in make_multi_voice_plan_dict()["utterances"]:
+        voice = SUMAN_VOICE_ID if raw["speaker_id"] == "suman" else NARRATOR_VOICE_ID
+        spoken_by_voice[voice].add(raw["tts_text"] or raw["original_text"])
+
+    requests = mock.tts_requests
+    assert len(requests) == 6  # one per utterance, story order
+    for request in requests:
+        voice = request["path"].rsplit("/", 1)[-1]
+        body = request["body"]
+        other = spoken_by_voice[SUMAN_VOICE_ID if voice == NARRATOR_VOICE_ID
+                                else NARRATOR_VOICE_ID]
+        for field in ("previous_text", "next_text"):
+            value = body.get(field)
+            if value:
+                assert value not in other, f"{field} leaked another speaker's line"
+        assert not body.get("previous_request_ids")
+        assert not body.get("next_request_ids")
+
+    # The character's line still carries its audio tags and its own voice.
+    suman = [r for r in requests if r["path"].endswith(SUMAN_VOICE_ID)]
+    assert len(suman) == 2
+    assert suman[0]["body"]["text"] == "[quiet, tense delivery] कभी आईने में मत देखना।"
+
+
+# --------------------------------------------------------------------------- #
+# 16. Long scripts (5k words) are planned in batches and merged
+# --------------------------------------------------------------------------- #
+class _ParagraphEchoMiMo:
+    """Answers every batch with one narrator utterance per numbered paragraph.
+
+    Reads the numbered paragraphs out of the prompt, so each response covers
+    exactly the batch the planner asked for (GLOBAL paragraph indices).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    def complete_json(self, *, system: str, user: str) -> str:
+        self.calls.append({"system": system, "user": user})
+        marker = "Script paragraphs (each becomes 1..k ordered utterances):\n"
+        remainder = user.split(marker, 1)[1]
+        numbered, _ = json.JSONDecoder().raw_decode(remainder.lstrip())
+        utterances = [
+            {
+                "utterance_id": f"echo-{item['paragraph_index']:04d}",
+                "paragraph_index": item["paragraph_index"],
+                "sequence_index": 0,
+                "speaker_id": "narrator",
+                "speaker_type": "narrator",
+                "original_text": item["text"],
+                "tts_text": item["text"],
+                "emotion": "neutral",
+                "acting_intensity": 2,
+                "delivery_style": "calm",
+                "narration_direction": "Steady narration.",
+                "pause_after_ms": 500,
+            }
+            for item in numbered
+        ]
+        return json.dumps({"utterances": utterances}, ensure_ascii=False)
+
+
+def test_five_thousand_word_scripts_are_planned_in_batches_and_merged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 5k-word manuscript plans in small batches (GLOBAL indices) and the
+    merged plan covers every paragraph — never a truncated/invalid response.
+    """
+    from app.services.multi_voice_planner import (
+        MAX_BATCH_CHARACTERS,
+        MAX_BATCH_PARAGRAPHS,
+    )
+
+    filler = (
+        "The old lamp flickered on the platform while the night train waited "
+        "in the rain, carrying tired passengers and their quiet untold stories "
+        "onward through the dark hours of the long journey home again, while "
+        "somewhere behind the windows a slow song kept playing softly on."
+    )
+    paragraphs: list[str] = []
+    for index in range(165):
+        if index % 5 == 2:
+            paragraphs.append(MV_PARAGRAPHS[index % len(MV_PARAGRAPHS)])
+        else:
+            paragraphs.append(f"{filler} Segment {index}.")
+    script = "\n\n".join(paragraphs)
+    assert len(script.split()) >= 5000, "the fixture really is a 5k-word script"
+
+    project = client.post("/projects", json={"name": "Long Script"}).json()[
+        "project_id"
+    ]
+    upload = client.post(
+        f"/projects/{project}/upload-script",
+        files={"file": ("script.txt", script.encode("utf-8"), "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+
+    _analyze(client, monkeypatch, project)
+    _wire_casting(monkeypatch)
+    _select_both(client, project)
+    _approve(client, project)
+
+    fake = _ParagraphEchoMiMo()
+    _use_planner(monkeypatch, fake)
+    response = client.post(f"/projects/{project}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # The merged plan covers every paragraph, in order, with global indices.
+    assert body["paragraph_count"] == len(paragraphs)
+    assert body["utterance_count"] == len(paragraphs)
+    assert body["speakers"] == ["narrator"]
+    assert [u["paragraph_index"] for u in body["utterances"]] == list(
+        range(len(paragraphs))
+    )
+
+    # …and no single MiMo call was ever asked for the whole script.
+    assert fake.calls, "the planner called MiMo"
+    assert len(fake.calls) > 1, "long scripts are split into batches"
+    seen: set[int] = set()
+    for call in fake.calls:
+        assert "This is one BATCH of a longer script" in call["user"]
+        marker = "Script paragraphs (each becomes 1..k ordered utterances):\n"
+        numbered, _ = json.JSONDecoder().raw_decode(
+            call["user"].split(marker, 1)[1].lstrip()
+        )
+        assert len(numbered) <= MAX_BATCH_PARAGRAPHS
+        assert sum(len(item["text"]) for item in numbered) <= MAX_BATCH_CHARACTERS
+        for item in numbered:
+            index = item["paragraph_index"]
+            assert index not in seen, "batches never overlap"
+            seen.add(index)
+            assert item["text"] == paragraphs[index], "global numbering is exact"
+    assert seen == set(range(len(paragraphs))), "every paragraph was planned"
+
+
+# --------------------------------------------------------------------------- #
+# 17. Narration beats between dialogue never belong to a character
+# --------------------------------------------------------------------------- #
+def _utterance(
+    uid: str,
+    seq: int,
+    speaker: str,
+    speaker_type: str,
+    text: str,
+    *,
+    paragraph_index: int = 2,
+    pause_after_ms: int = 200,
+) -> dict[str, Any]:
+    return {
+        "utterance_id": uid,
+        "paragraph_index": paragraph_index,
+        "sequence_index": seq,
+        "speaker_id": speaker,
+        "speaker_type": speaker_type,
+        "original_text": text,
+        "tts_text": text,
+        "emotion": "neutral",
+        "acting_intensity": 2,
+        "delivery_style": "calm",
+        "narration_direction": "Steady delivery.",
+        "pause_after_ms": pause_after_ms,
+    }
+
+
+def test_narration_beats_between_dialogue_stay_with_the_narrator(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live bug: 1-2 narration words between two dialogue lines ("he
+    said.", "उसने कहा,") were spoken by a character. Both the separate-beat
+    and the merged-beat misassignments must be rejected with targeted
+    feedback so MiMo splits them out for the narrator.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    _wire_casting(monkeypatch)
+    _select_both(client, project_with_script)
+    _approve(client, project_with_script)
+
+    # BAD A — the beat "उसने कहा," is its own utterance but spoken by SUMAN.
+    bad_beat = [
+        _utterance("a0", 0, "narrator", "narrator", "सुमन ने चाबी सौंपी और चेतावनी दी",
+                   paragraph_index=0),
+        _utterance("a1", 1, "suman", "character", "कभी आईने में मत देखना।",
+                   paragraph_index=0, pause_after_ms=700),
+        _utterance("a2", 0, "narrator", "narrator", "अचानक दरवाजे पर राहुल ने दस्तक दी।",
+                   paragraph_index=1, pause_after_ms=500),
+        _utterance("a3", 0, "narrator", "narrator", "सुमन मुस्कुराई।", pause_after_ms=150),
+        _utterance("a4", 1, "suman", "character", "उसने कहा,"),
+        _utterance("a5", 2, "suman", "character", "डरो मत।"),
+        _utterance("a6", 3, "narrator", "narrator", "फिर वह चुप हो गई।",
+                   pause_after_ms=700),
+    ]
+    # BAD B — the beat "उसने कहा," is MERGED into SUMAN's dialogue line.
+    bad_merged = [
+        _utterance("b0", 0, "narrator", "narrator", "सुमन ने चाबी सौंपी और चेतावनी दी",
+                   paragraph_index=0),
+        _utterance("b1", 1, "suman", "character", "कभी आईने में मत देखना।",
+                   paragraph_index=0, pause_after_ms=700),
+        _utterance("b2", 0, "narrator", "narrator", "अचानक दरवाजे पर राहुल ने दस्तक दी।",
+                   paragraph_index=1, pause_after_ms=500),
+        _utterance("b3", 0, "narrator", "narrator", "सुमन मुस्कुराई।", pause_after_ms=150),
+        _utterance("b4", 1, "suman", "character", "उसने कहा, डरो मत।"),
+        _utterance("b5", 2, "narrator", "narrator", "फिर वह चुप हो गई।",
+                   pause_after_ms=700),
+    ]
+    good = make_multi_voice_plan_dict()["utterances"]
+
+    fake = FakeMiMo([
+        json.dumps({"utterances": bad_beat}, ensure_ascii=False),
+        json.dumps({"utterances": bad_merged}, ensure_ascii=False),
+        json.dumps({"utterances": good}, ensure_ascii=False),
+    ])
+    _use_planner(monkeypatch, fake)
+    response = client.post(f"/projects/{project_with_script}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 3, "both misassignments rejected, then accepted"
+
+    first_feedback = fake.calls[1]["user"]
+    assert "dialogue beat" in first_feedback
+    assert "उसने कहा," in first_feedback
+    assert "ALWAYS belong to the narrator" in first_feedback
+
+    second_feedback = fake.calls[2]["user"]
+    assert "merged into" in second_feedback
+    assert "split it out into its own narrator utterance" in second_feedback
+
+
+def test_quoted_dialogue_words_never_leak_to_characters(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In quoted paragraphs a character may only speak the words INSIDE the
+    quotation marks — narration between the quotes is the narrator's.
+    """
+    script = "सुमन ने राहुल से कहा, “मैं ठीक हूँ।” और फिर वह चली गई।"
+    project = client.post("/projects", json={"name": "Quote Test"}).json()[
+        "project_id"
+    ]
+    upload = client.post(
+        f"/projects/{project}/upload-script",
+        files={"file": ("script.txt", script.encode("utf-8"), "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+
+    _analyze(client, monkeypatch, project)
+    _wire_casting(monkeypatch)
+    _select_both(client, project)
+    _approve(client, project)
+
+    # BAD — SUMAN also speaks the unquoted narration "और फिर वह चली गई।".
+    bad = [
+        _utterance("q0", 0, "narrator", "narrator", "सुमन ने राहुल से कहा,",
+                   paragraph_index=0),
+        _utterance("q1", 1, "suman", "character", "मैं ठीक हूँ। और फिर वह चली गई।",
+                   paragraph_index=0, pause_after_ms=700),
+    ]
+    # GOOD — only the quoted words belong to SUMAN.
+    good = [
+        _utterance("g0", 0, "narrator", "narrator", "सुमन ने राहुल से कहा,",
+                   paragraph_index=0),
+        _utterance("g1", 1, "suman", "character", "मैं ठीक हूँ।", paragraph_index=0),
+        _utterance("g2", 2, "narrator", "narrator", "और फिर वह चली गई।",
+                   paragraph_index=0, pause_after_ms=700),
+    ]
+
+    fake = FakeMiMo([
+        json.dumps({"utterances": bad}, ensure_ascii=False),
+        json.dumps({"utterances": good}, ensure_ascii=False),
+    ])
+    _use_planner(monkeypatch, fake)
+    response = client.post(f"/projects/{project}/create-multi-voice-plan")
+    assert response.status_code == 200, response.text
+    assert fake.call_count == 2, "the leaked narration rejected, then accepted"
+    assert "outside the quoted dialogue" in fake.calls[1]["user"]
+
+
+def test_plan_prompt_teaches_the_narration_beat_split() -> None:
+    """MiMo cannot obey a split rule it never sees — the prompt must teach
+    that one-or-two-word narration beats are narrator lines (the live bug).
+    """
+    from app.services.multi_voice_planner import SYSTEM_PROMPT
+
+    assert "SPLITTING EXAMPLE" in SYSTEM_PROMPT
+    assert "EVEN WHEN IT IS ONLY ONE OR TWO WORDS" in SYSTEM_PROMPT
+    assert "said Rohan, wiping his hands." in SYSTEM_PROMPT
+    assert "NEVER merge an attribution beat" in SYSTEM_PROMPT
+    assert "उसने कहा," in SYSTEM_PROMPT

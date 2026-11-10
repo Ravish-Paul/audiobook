@@ -214,8 +214,11 @@ def test_static_javascript_never_hardcodes_the_script_limit() -> None:
 @pytest.mark.skipif(
     not (REPO_ROOT / ".env").exists(), reason="repository .env is not present"
 )
-def test_configured_server_script_limit_is_three_thousand() -> None:
-    """The real server value (from .env) that GET /usage serves."""
+def test_configured_server_script_limit_supports_long_scripts() -> None:
+    """The real server value (from .env) that GET /usage serves.
+
+    It must stay large enough for a 5,000-word manuscript (~35k characters).
+    """
     env = {
         key: value
         for key, value in os.environ.items()
@@ -235,7 +238,7 @@ def test_configured_server_script_limit_is_three_thousand() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "3000", result.stdout + result.stderr
+    assert result.stdout.strip() == "200000", result.stdout + result.stderr
 
 
 # --------------------------------------------------------------------------- #

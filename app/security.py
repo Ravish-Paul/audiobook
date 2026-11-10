@@ -62,6 +62,8 @@ DOCS_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
 GENERATION_SUFFIXES = (
     "/analyze-narration",
     "/analyze-narration/preview",
+    "/analyze-story",
+    "/narration-preview/audio",
     "/generate-audio",
     "/analyze-characters",
     "/create-multi-voice-plan",
@@ -251,6 +253,8 @@ _PLAN_SUFFIXES = ("/analyze-narration", "/create-multi-voice-plan")
 # They keep their rate limiting and duplicate-submission protection.
 _AUX_SUFFIXES = (
     "/analyze-narration/preview",
+    "/analyze-story",
+    "/narration-preview/audio",
     "/analyze-characters",
     "/voice-casting/audition",
     "/audio-analysis",
@@ -545,6 +549,28 @@ def _is_generation_path(path: str) -> bool:
     )
 
 
+async def _read_request_body(receive) -> bytes:  # noqa: ANN001
+    """Consume the ASGI request body once (empty when the request has none)."""
+    chunks: list[bytes] = []
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            break
+        chunks.append(message.get("body", b"") or b"")
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks)
+
+
+def _replay_body(body: bytes):  # noqa: ANN001
+    """A `receive` that replays a body the middleware already consumed."""
+
+    async def receive() -> dict:  # noqa: ANN001
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
 # --------------------------------------------------------------------------- #
 # ASGI middleware
 # --------------------------------------------------------------------------- #
@@ -632,10 +658,16 @@ class BetaSecurityMiddleware:
         #    diarization) keep their duplicate guard but never touch the
         #    complete-audiobook allowance.
         if method == "POST" and _is_generation_path(path):
-            key = f"{tester}:{path}"
+            # The body is part of the duplicate key: an identical resubmission
+            # (double click) is still refused, while genuinely different work
+            # inside the window — e.g. previewing ANOTHER voice right after
+            # the first one — is allowed. The bytes are replayed downstream.
+            raw_body = await _read_request_body(receive)
+            body_digest = hashlib.sha256(raw_body).hexdigest()[:16]
+            key = f"{tester}:{path}:{body_digest}"
             duplicate = _duplicate_begin(key, settings.beta_duplicate_window_seconds)
             if duplicate:
-                await _json(duplicate, 409)(scope, receive, send)
+                await _json(duplicate, 409)(scope, _replay_body(raw_body), send)
                 return
 
             kind = _generation_kind(path)
@@ -665,7 +697,7 @@ class BetaSecurityMiddleware:
                 await send(message)
 
             try:
-                await self.app(scope, receive, send_wrapper)
+                await self.app(scope, _replay_body(raw_body), send_wrapper)
             finally:
                 succeeded = status_box.get("status", 500) < 400
                 _GENERATION_ID.reset(generation_token)

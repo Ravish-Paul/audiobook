@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, status
+from fastapi.responses import Response
 
 from app.config import get_settings
 from app.schemas.narration import NarrationPlanResponse, NarrationPreviewResponse
@@ -25,9 +26,11 @@ from app.schemas.narration_preferences import (
     AnalyzeNarrationRequest,
     NarrationPreferences,
     NarrationPreferencesResponse,
+    PreviewNarrationAudioRequest,
     PreviewNarrationRequest,
 )
-from app.services import NarrationPlanner
+from app.schemas.story_analysis import StoryAnalysisRequest, StoryAnalysisResponse
+from app.services import NarrationPlanner, StoryAnalysisService
 
 # Mounted under /projects so URLs stay consistent with the rest of the API.
 router = APIRouter(prefix="/projects", tags=["Narration"])
@@ -36,6 +39,71 @@ router = APIRouter(prefix="/projects", tags=["Narration"])
 def _planner() -> NarrationPlanner:
     """Fresh service per request (settings are re-read from the environment)."""
     return NarrationPlanner(get_settings())
+
+
+def _story_service() -> StoryAnalysisService:
+    return StoryAnalysisService(get_settings())
+
+
+@router.post(
+    "/{project_id}/analyze-story",
+    response_model=StoryAnalysisResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Analyse the whole story (genre, mood progression, profile)",
+    response_description="The directing analysis (also saved to disk)",
+)
+def analyze_story(
+    project_id: str,
+    request: Optional[StoryAnalysisRequest] = None,
+) -> StoryAnalysisResponse:
+    """Read the whole script and return a directing analysis.
+
+    This is an auxiliary provider call: it never consumes a complete-audiobook
+    allowance. A saved analysis that still describes the current script is
+    reused unless `{"force": true}` is sent.
+    """
+    return _story_service().analyze(
+        project_id, force=bool(request and request.force)
+    )
+
+
+@router.get(
+    "/{project_id}/story-analysis",
+    response_model=StoryAnalysisResponse,
+    summary="Get the saved whole-story analysis",
+    response_description="The saved analysis, or 404 when none exists",
+)
+def get_story_analysis(project_id: str) -> StoryAnalysisResponse:
+    return _story_service().get(project_id)
+
+
+@router.post(
+    "/{project_id}/narration-preview/audio",
+    summary="Render one representative narration line",
+    response_description="MP3 audio for the previewed paragraph",
+)
+async def preview_narration_audio(
+    project_id: str, request: PreviewNarrationAudioRequest
+) -> Response:
+    """Synthesise ONE paragraph as a short sample on explicit user action.
+
+    Uses the existing narration-preview planner (aux MiMo) and the
+    capability-filtered ElevenLabs client. Nothing is written to the project's
+    audiobook files and no complete-audiobook allowance is consumed.
+    """
+    audio = await _planner().preview_audio(
+        project_id,
+        request.paragraph_index,
+        preferences=request.preferences,
+    )
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'inline; filename="narration-preview.mp3"',
+        },
+    )
 
 
 @router.post(

@@ -309,6 +309,55 @@ def story_json(**overrides: Any) -> str:
     return json.dumps(make_story_analysis_dict(**overrides), ensure_ascii=False)
 
 
+def make_director_analysis_dict(**overrides: Any) -> dict[str, Any]:
+    """A valid whole-story DIRECTING analysis (StoryDirectorAnalysis).
+
+    The fake script's paragraphs are covered by two scenes; the recommended
+    profile is `horror` (the casting fixture's story is horror).
+    """
+    analysis: dict[str, Any] = {
+        "primary_genre": "horror",
+        "secondary_genre": "mystery",
+        "emotional_tone": "quiet dread with human warmth",
+        "dominant_mood": "suspenseful",
+        "language": "hi",
+        "scene_progression": [
+            {
+                "scene_index": 0,
+                "start_paragraph_index": 0,
+                "end_paragraph_index": 1,
+                "mood": "calm",
+                "intensity": 2,
+                "summary": "The key and the warning are handed over calmly.",
+            },
+            {
+                "scene_index": 1,
+                "start_paragraph_index": 2,
+                "end_paragraph_index": 2,
+                "mood": "tense",
+                "intensity": 4,
+                "summary": "The knock and the mirror warning build unease.",
+            },
+        ],
+        "recommended_profile": "horror",
+        "recommended_direction": (
+            "Start grounded and calm, let unease grow through pacing and "
+            "silence; only the final warning carries dread."
+        ),
+        "character_tendencies": [
+            {"character_name": "सुमन", "tendency": "calm and protective"},
+            {"character_name": "राहुल", "tendency": "nervous and watchful"},
+        ],
+        "intimacy_level": "none",
+    }
+    analysis.update(overrides)
+    return analysis
+
+
+def director_analysis_json(**overrides: Any) -> str:
+    return json.dumps(make_director_analysis_dict(**overrides), ensure_ascii=False)
+
+
 def multi_voice_plan_json(**overrides: Any) -> str:
     return json.dumps(make_multi_voice_plan_dict(**overrides), ensure_ascii=False)
 

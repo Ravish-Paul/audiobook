@@ -640,7 +640,9 @@ def test_plan_hash_includes_preferences_and_keeps_legacy_hash_stable() -> None:
     # so no already-paid-for segment is silently re-billed.
     data = legacy.model_dump(mode="json")
     assert data["preferences"] is None
-    data.pop("preferences")
+    for optional in ("preferences", "story_analysis", "effective_profile"):
+        if data.get(optional) is None:
+            data.pop(optional, None)
     expected = hashlib.sha256(
         json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()[:16]
@@ -919,7 +921,8 @@ def test_frontend_panel_is_served_to_browsers(client: TestClient) -> None:
         "Generate Audiobook",
         "Natural",
         "Cinematic",
-        "Expressive",
+        "Horror",
+        "Sensual",
     ):
         assert marker in html, marker
 

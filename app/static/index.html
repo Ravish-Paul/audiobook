@@ -215,21 +215,126 @@
     <!-- ──────────────────────── 3 · Narration style ───────────────────── -->
     <section class="card" aria-labelledby="style-heading">
       <h2 id="style-heading"><span class="step-badge" id="step-badge-style" aria-hidden="true">3</span> Narration style</h2>
-      <div class="style-grid" role="radiogroup" aria-label="Narration style">
+      <p class="section-intro">How should your audiobook sound?</p>
+      <div id="mood-modes" role="radiogroup" aria-label="Mood mode">
+        <div class="mode-switch">
+          <label class="mode-option" id="mood-mode-auto-label" for="mood-mode-auto">
+            <input type="radio" name="mood-mode" id="mood-mode-auto" value="auto" checked />
+            <span>Let AI choose based on my story</span>
+          </label>
+          <label class="mode-option" id="mood-mode-manual-label" for="mood-mode-manual">
+            <input type="radio" name="mood-mode" id="mood-mode-manual" value="manual" />
+            <span>I&rsquo;ll choose the mood</span>
+          </label>
+        </div>
+      </div>
+      <p class="hint" id="mood-auto-hint">
+        AI reads your whole story, detects the genre and mood, and recommends the
+        best narration profile. You can override it.
+      </p>
+
+      <div class="analysis-actions">
+        <button id="btn-analyze-story" class="btn btn-secondary" type="button" disabled>
+          Analyze my story
+        </button>
+        <button id="btn-narration-preview" class="btn btn-secondary" type="button" disabled>
+          Preview the narration
+        </button>
+        <span id="analysis-status" class="hint" role="status"></span>
+      </div>
+
+      <div id="story-analysis-panel" class="analysis-panel hidden">
+        <div class="analysis-grid">
+          <div class="analysis-item">
+            <span class="analysis-label">Detected genre</span>
+            <span id="analysis-genre" class="analysis-value"></span>
+          </div>
+          <div class="analysis-item">
+            <span class="analysis-label">Recommended style</span>
+            <span id="analysis-profile" class="analysis-value"></span>
+          </div>
+          <div class="analysis-item">
+            <span class="analysis-label">Story mood</span>
+            <span id="analysis-mood" class="analysis-value"></span>
+          </div>
+          <div class="analysis-item">
+            <span class="analysis-label">Language</span>
+            <span id="analysis-language" class="analysis-value"></span>
+          </div>
+        </div>
+        <p class="analysis-direction" id="analysis-direction"></p>
+        <div class="analysis-scenes-wrap">
+          <span class="analysis-label">Scene progression</span>
+          <ol id="analysis-scenes" class="analysis-scenes"></ol>
+        </div>
+        <div class="analysis-panel-actions">
+          <button id="btn-use-recommended" class="btn btn-secondary" type="button">
+            Use recommended style
+          </button>
+        </div>
+        <audio id="preview-player" class="preview-player hidden" controls preload="metadata"></audio>
+      </div>
+
+      <div class="style-grid hidden" role="radiogroup" aria-label="Narration style">
         <button type="button" class="style-card" role="radio" aria-checked="true"
                 data-style="natural" id="style-natural">
-          <span class="style-name">Natural</span>
-          <span class="style-desc">Clear, conversational, realistic narration.</span>
+          <span class="style-name">Natural &amp; Conversational</span>
+          <span class="style-desc">Clear, conversational and realistic storytelling.</span>
         </button>
         <button type="button" class="style-card" role="radio" aria-checked="false"
                 data-style="cinematic" id="style-cinematic" tabindex="-1">
-          <span class="style-name">Cinematic</span>
-          <span class="style-desc">Immersive and emotionally controlled storytelling.</span>
+          <span class="style-name">Cinematic &amp; Immersive</span>
+          <span class="style-desc">Atmospheric, immersive and dramatically controlled.</span>
         </button>
         <button type="button" class="style-card" role="radio" aria-checked="false"
-                data-style="expressive" id="style-expressive" tabindex="-1">
-          <span class="style-name">Expressive</span>
-          <span class="style-desc">More emotional variation when the story requires it.</span>
+                data-style="horror" id="style-horror" tabindex="-1">
+          <span class="style-name">Horror &amp; Suspense</span>
+          <span class="style-desc">Gradual tension, unease and suspense.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="romantic" id="style-romantic" tabindex="-1">
+          <span class="style-name">Romantic &amp; Intimate</span>
+          <span class="style-desc">Warm, affectionate and emotionally close.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="sensual" id="style-sensual" tabindex="-1">
+          <span class="style-name">Sensual &amp; Intimate</span>
+          <span class="style-desc">Close, subtle intimacy only where the scene allows it.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="emotional" id="style-emotional" tabindex="-1">
+          <span class="style-name">Emotional &amp; Reflective</span>
+          <span class="style-desc">Sincere, reflective and gently emotional.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="action" id="style-action" tabindex="-1">
+          <span class="style-name">Action &amp; Adventure</span>
+          <span class="style-desc">Energetic, urgent and sharply focused.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="mystery" id="style-mystery" tabindex="-1">
+          <span class="style-name">Mystery &amp; Thriller</span>
+          <span class="style-desc">Measured, curious and quietly tense.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="fantasy" id="style-fantasy" tabindex="-1">
+          <span class="style-name">Fantasy &amp; Epic</span>
+          <span class="style-desc">Atmospheric, wondrous and epic in scale.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="comedy" id="style-comedy" tabindex="-1">
+          <span class="style-name">Comedy &amp; Lighthearted</span>
+          <span class="style-desc">Natural timing with playful lightness.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="professional" id="style-professional" tabindex="-1">
+          <span class="style-name">Calm &amp; Professional</span>
+          <span class="style-desc">Clear, steady and composed.</span>
+        </button>
+        <button type="button" class="style-card" role="radio" aria-checked="false"
+                data-style="children" id="style-children" tabindex="-1">
+          <span class="style-name">Children&rsquo;s Story</span>
+          <span class="style-desc">Warm, clear and friendly storytelling.</span>
         </button>
       </div>
     </section>

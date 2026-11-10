@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from typing import Optional, Sequence
 
 from app.schemas.narration import NarrationPlan, ParagraphPlan
@@ -72,15 +73,37 @@ DRAMATIC_RE = re.compile(
 # the paragraphs being validated. `natural` tolerates none at all.
 PRESET_MARKER_FRACTION: dict[str, float] = {
     "natural": 0.0,
+    "cinematic": 0.2,
+    "horror": 0.35,
+    "romantic": 0.05,
+    "sensual": 0.05,
+    "emotional": 0.15,
+    "action": 0.45,
+    "mystery": 0.2,
+    "fantasy": 0.35,
+    "comedy": 0.25,
+    "professional": 0.0,
+    "children": 0.2,
+    # Legacy presets keep their historical budgets.
     "restrained_cinematic": 0.15,
     "expressive": 0.5,
     "dramatic": 1.0,
+    # Intimate moods stay quiet — amplified markers would break the mood.
+    "soft": 0.0,
+    "smooth": 0.0,
+    # AI-automatic mood: the model may stage genuine peaks (like `expressive`).
+    "auto": 0.5,
 }
 
 # Minimum stability for the restrained presets (an unnecessarily low
 # stability makes the voice unstable and "acted").
 RESTRAINED_STABILITY_FLOOR = 0.45
-RESTRAINED_PRESETS = ("natural", "restrained_cinematic")
+RESTRAINED_PRESETS = (
+    "natural",
+    "restrained_cinematic",
+    "professional",
+    "children",
+)
 
 # Voice identity must not drift between paragraphs.
 MAX_STABILITY_SPREAD = 0.35
@@ -373,6 +396,7 @@ class NarrationPolicyValidator:
         problems += self._check_tag_density(paragraphs)
         problems += self._check_marker_budgets(paragraphs)
         problems += self._check_unnecessary_delivery_changes(paragraphs)
+        problems += self._check_variety(paragraphs)
         problems += self._check_voice_settings(paragraphs)
         return problems
 
@@ -528,6 +552,90 @@ class NarrationPolicyValidator:
                     "drop the tag or justify it with the declared delivery"
                 )
         return problems
+
+    def _check_variety(self, paragraphs: Sequence[ParagraphPlan]) -> list[str]:
+        """Reject a plan that stamps ONE direction/mood on the whole story.
+
+        The global profile is a boundary, not a per-paragraph instruction:
+        neutral narration must survive, horror must not be frightening in
+        every paragraph and a romance must not be intimate in every paragraph.
+        """
+        problems: list[str] = []
+        count = len(paragraphs)
+        if count < 4:
+            return problems
+
+        directions = [
+            self._direction_key(item.narration_direction) for item in paragraphs
+        ]
+        non_empty = [direction for direction in directions if direction]
+        if non_empty:
+            direction, hits = Counter(non_empty).most_common(1)[0]
+            threshold = max(3, math.ceil(count * 0.6))
+            if hits >= threshold and len(set(non_empty)) < max(3, count // 2):
+                problems.append(
+                    f"narration_direction is repeated almost identically in "
+                    f"{hits}/{count} paragraphs — write a fresh, scene-specific "
+                    "direction for each part instead of copying one instruction"
+                )
+
+        emotions = Counter(
+            item.emotion for item in paragraphs if item.emotion != "neutral"
+        )
+        if emotions:
+            emotion, hits = emotions.most_common(1)[0]
+            limit = math.ceil(count * 0.75)
+            if hits >= limit:
+                problems.append(
+                    f"emotion '{emotion}' is used in {hits}/{count} paragraphs — "
+                    "do NOT apply one mood to the whole story. Keep neutral "
+                    "narration neutral and let the emotion change with the scene"
+                )
+
+        # Profile-specific overuse: these moods are especially easy to overdo.
+        profile_mood_families: dict[str, set[str]] = {
+            "sensual": {"intimate", "romance", "tenderness", "vulnerable"},
+            "romantic": {"romance", "tenderness", "intimate", "vulnerable"},
+            "horror": {"fear", "suspense", "tense", "suspicious"},
+            "emotional": {"sadness", "grieving", "vulnerable", "reflective"},
+            "action": {"excitement", "urgent", "anger", "confidence"},
+        }
+        family = profile_mood_families.get(self.preferences.preset)
+        if family and count >= 4:
+            family_hits = sum(
+                1 for item in paragraphs if item.emotion in family
+            )
+            family_limit = math.ceil(count * 0.6)
+            if family_hits >= family_limit:
+                problems.append(
+                    f"the '{self.preferences.preset}' profile is applied to "
+                    f"{family_hits}/{count} paragraphs as the same emotional "
+                    "family — intimate/scary/energetic delivery belongs only "
+                    "where the scene supports it; keep ordinary scenes natural"
+                )
+
+        tags = Counter(
+            tag.casefold()
+            for paragraph in paragraphs
+            for tag in _tags_of(paragraph)
+        )
+        if tags:
+            tag, hits = tags.most_common(1)[0]
+            tag_limit = max(3, math.ceil(count * 0.6))
+            if hits >= tag_limit:
+                problems.append(
+                    f"audio tag [{tag}] is repeated in {hits}/{count} "
+                    "paragraphs — tags are sparse and intentional; remove the "
+                    "copied tags and keep them only where the delivery changes"
+                )
+        return problems
+
+    @staticmethod
+    def _direction_key(direction: str) -> str:
+        """Normalised direction text for repetition detection."""
+        return " ".join(
+            re.sub(r"[^\w\s]", " ", (direction or "").casefold()).split()
+        )
 
     def _check_voice_settings(self, paragraphs: Sequence[ParagraphPlan]) -> list[str]:
         problems: list[str] = []

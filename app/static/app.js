@@ -13,40 +13,96 @@
 /* ------------------------------------------------------------------------- */
 /* Narration styles -> the backend NarrationPreferences object                */
 /* ------------------------------------------------------------------------- */
+/* The twelve global narration profiles. Each id maps to a real backend
+ * `NarrationPreferences` object — the preset changes the MiMo system prompt
+ * and the policy boundaries, not just a label. `whisper_paragraphs` is always
+ * empty: whispering is only ever allowed on lines the user explicitly picks. */
+function presetPreferences(
+  preset,
+  actingIntensity,
+  whisperPolicy,
+  tagDensity
+) {
+  return {
+    preset,
+    acting_intensity: actingIntensity,
+    whisper_policy: whisperPolicy,
+    whisper_paragraphs: [],
+    tag_density: tagDensity,
+    custom_direction: "",
+  };
+}
+
 const STYLE_PRESETS = {
   natural: {
-    label: "Natural",
-    preferences: {
-      preset: "natural",
-      acting_intensity: 2,
-      whisper_policy: "never",
-      whisper_paragraphs: [],
-      tag_density: "minimal",
-      custom_direction: "",
-    },
+    label: "Natural & Conversational",
+    preferences: presetPreferences("natural", 2, "never", "minimal"),
   },
   cinematic: {
-    label: "Cinematic",
-    preferences: {
-      preset: "restrained_cinematic",
-      acting_intensity: 2,
-      whisper_policy: "user_selected",
-      whisper_paragraphs: [],
-      tag_density: "minimal",
-      custom_direction: "",
-    },
+    label: "Cinematic & Immersive",
+    preferences: presetPreferences("cinematic", 2, "user_selected", "minimal"),
   },
-  expressive: {
-    label: "Expressive",
-    preferences: {
-      preset: "expressive",
-      acting_intensity: 3,
-      whisper_policy: "user_selected",
-      whisper_paragraphs: [],
-      tag_density: "standard",
-      custom_direction: "",
-    },
+  horror: {
+    label: "Horror & Suspense",
+    preferences: presetPreferences("horror", 3, "user_selected", "standard"),
   },
+  romantic: {
+    label: "Romantic & Intimate",
+    preferences: presetPreferences("romantic", 2, "user_selected", "minimal"),
+  },
+  sensual: {
+    label: "Sensual & Intimate",
+    preferences: presetPreferences("sensual", 2, "user_selected", "standard"),
+  },
+  emotional: {
+    label: "Emotional & Reflective",
+    preferences: presetPreferences("emotional", 2, "user_selected", "minimal"),
+  },
+  action: {
+    label: "Action & Adventure",
+    preferences: presetPreferences("action", 4, "never", "standard"),
+  },
+  mystery: {
+    label: "Mystery & Thriller",
+    preferences: presetPreferences("mystery", 2, "user_selected", "minimal"),
+  },
+  fantasy: {
+    label: "Fantasy & Epic",
+    preferences: presetPreferences("fantasy", 3, "user_selected", "standard"),
+  },
+  comedy: {
+    label: "Comedy & Lighthearted",
+    preferences: presetPreferences("comedy", 3, "never", "standard"),
+  },
+  professional: {
+    label: "Calm & Professional",
+    preferences: presetPreferences("professional", 1, "never", "minimal"),
+  },
+  children: {
+    label: "Children's Story",
+    preferences: presetPreferences("children", 3, "never", "standard"),
+  },
+};
+
+/* Old localStorage sessions may still hold a retired style id. Map them onto
+ * the closest current profile instead of silently falling back to Natural. */
+const LEGACY_STYLE_ALIASES = {
+  expressive: "emotional",
+  soft: "romantic",
+  smooth: "natural",
+};
+
+function normalizeStyleId(style) {
+  if (STYLE_PRESETS[style]) return style;
+  return LEGACY_STYLE_ALIASES[style] || "natural";
+}
+
+/* "AI Automatic" mood mode — MiMo analyses the whole story and recommends a
+ * global profile (the backend `auto` preset). `state.moodMode` decides which
+ * of the two the generate step sends. */
+const AUTO_MOOD = {
+  label: "AI Automatic",
+  preferences: presetPreferences("auto", 3, "user_selected", "standard"),
 };
 
 const MAX_SCRIPT_BYTES = 5 * 1024 * 1024;
@@ -55,10 +111,18 @@ const STORAGE_KEY = "audiobook.state.v1";
 const state = {
   busy: false,
   style: "natural",
+  moodMode: "auto", // "auto" = AI picks the mood | "manual" = the chosen style card
   languageOverride: "", // "" = auto-detect
   project: null, // {id, title, language, paragraphCount, preview, filename, sizeBytes, characterCount}
   planKey: null, // preferences the saved narration plan was built with
   audio: null, // {url, filename}
+  // Whole-story directing analysis (AI Narration Director). Server-authoritative
+  // — `analysisKey` is `${projectId}:${characterCount}` so a replaced script
+  // never reuses an old analysis display.
+  storyAnalysis: null, // StoryAnalysisResponse.analysis
+  analysisKey: null,
+  analysisStatus: "idle", // idle | loading | ready | error
+  preview: { status: "idle", url: null, error: null }, // narration preview audio
   usage: null, // /usage: {generation_limit, generations_used, generations_remaining, max_script_characters}
   usageStatus: "loading", // "loading" | "ready" | "error" — never fake a limit
   characterCount: 0, // script length in Unicode code points (same count as the backend)
@@ -76,9 +140,9 @@ const state = {
     drafts: {}, // speakerId -> voice_id chosen in the UI (not yet locked)
     busy: false, // analysis / casting / approval in flight
     runId: 0, // invalidates work started for a replaced script
-    auditions: {}, // speakerId -> {status, url, audio, error}
-    auditionBusy: false, // one preview at a time (server guards by path)
-    lastAuditionAt: 0, // cooldown after a SUCCESSFUL preview
+    auditions: {}, // speakerId -> {status, url, audio, error, voiceId}
+    auditionSeq: 0, // token: stale in-flight previews never start playing
+    auditionCooldowns: {}, // `${speakerId}:${voiceId}` -> last success time
     mvPlanKey: null, // script + cast the saved multi-voice plan was built for
     analysisError: null,
   },
@@ -167,9 +231,12 @@ function saveState() {
       STORAGE_KEY,
       JSON.stringify({
         style: state.style,
+        moodMode: state.moodMode,
         languageOverride: state.languageOverride,
         project: state.project,
         planKey: state.planKey,
+        storyAnalysis: state.storyAnalysis,
+        analysisKey: state.analysisKey,
         audio: state.audio,
         casting: {
           enabled: state.casting.enabled,
@@ -293,7 +360,21 @@ function refreshButtons() {
       ? "Character casting is not finished yet."
       : castOn && !castReady
         ? "Continue the character casting to enable generation."
-        : `Ready to generate · ${STYLE_PRESETS[state.style].label} style.`;
+        : `Ready to generate · ${
+            state.moodMode === "auto"
+              ? `${AUTO_MOOD.label} mood`
+              : `${STYLE_PRESETS[state.style].label} style`
+          }.`;
+  const analyzeButton = $("btn-analyze-story");
+  if (analyzeButton) {
+    analyzeButton.disabled =
+      !state.project || state.busy || state.analysisStatus === "loading";
+  }
+  const previewButton = $("btn-narration-preview");
+  if (previewButton) {
+    previewButton.disabled =
+      !state.project || state.busy || state.preview.status === "loading";
+  }
   const toggle = $("mv-toggle");
   if (toggle) {
     toggle.checked = state.casting.enabled;
@@ -440,6 +521,7 @@ async function importScript(file) {
   state.characterCount = data.character_count;
   state.audio = null;
   state.planKey = null;
+  resetStoryAnalysis();
   // A replaced script is a NEW project: the previous character analysis and
   // voice assignments must never be shown for it (§"invalidate on replace").
   invalidateCasting();
@@ -464,6 +546,7 @@ function removeScript() {
   state.audio = null;
   state.planKey = null;
   state.characterCount = 0;
+  resetStoryAnalysis();
   invalidateCasting({ full: true }); // no script → no casting option either
   $("file-input").value = "";
   $("file-panel").classList.add("hidden");
@@ -496,7 +579,7 @@ async function deleteMyData() {
 function bindStyle() {
   const cards = Array.from(document.querySelectorAll(".style-card"));
   cards.forEach((card) => {
-    card.addEventListener("click", () => selectStyle(card.dataset.style));
+    card.addEventListener("click", () => selectStyle(card.dataset.style, true));
     card.addEventListener("keydown", (event) => {
       const keys = ["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp"];
       if (!keys.includes(event.key)) return;
@@ -504,10 +587,28 @@ function bindStyle() {
       const index = cards.indexOf(card);
       const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1;
       const next = cards[(index + step + cards.length) % cards.length];
-      selectStyle(next.dataset.style);
+      selectStyle(next.dataset.style, true);
       next.focus();
     });
   });
+
+  const moodAuto = $("mood-mode-auto");
+  if (moodAuto) moodAuto.addEventListener("change", () => selectMoodMode("auto"));
+  const moodManual = $("mood-mode-manual");
+  if (moodManual) moodManual.addEventListener("change", () => selectMoodMode("manual"));
+
+  const analyzeButton = $("btn-analyze-story");
+  if (analyzeButton) {
+    analyzeButton.addEventListener("click", () => run(analyzeStory));
+  }
+  const useRecommended = $("btn-use-recommended");
+  if (useRecommended) {
+    useRecommended.addEventListener("click", useRecommendedStyle);
+  }
+  const previewButton = $("btn-narration-preview");
+  if (previewButton) {
+    previewButton.addEventListener("click", () => run(previewNarration));
+  }
 
   $("btn-language-override").addEventListener("click", () => {
     const row = $("language-override-row");
@@ -545,9 +646,13 @@ function bindStyle() {
   });
 }
 
-function selectStyle(style) {
+function selectStyle(style, userInitiated = false) {
   if (!STYLE_PRESETS[style]) return;
   state.style = style;
+  if (userInitiated && state.moodMode !== "manual") {
+    // Picking a card IS the manual choice — switch the mode for the user.
+    selectMoodMode("manual");
+  }
   document.querySelectorAll(".style-card").forEach((card) => {
     const selected = card.dataset.style === style;
     card.setAttribute("aria-checked", String(selected));
@@ -560,14 +665,279 @@ function selectStyle(style) {
   }
 }
 
+/* Mood mode: "AI Automatic" (MiMo analyses the story and picks the direction)
+ * or "Manual" (the selected profile card is applied). Mirrors the casting mode
+ * switch — same interaction, same accessibility. */
+function selectMoodMode(mode) {
+  if (mode !== "auto" && mode !== "manual") return;
+  state.moodMode = mode;
+  const automatic = mode === "auto";
+  const grid = document.querySelector(".style-grid");
+  if (grid) grid.classList.toggle("hidden", automatic);
+  const hint = $("mood-auto-hint");
+  if (hint) hint.classList.toggle("hidden", !automatic);
+  const autoRadio = $("mood-mode-auto");
+  if (autoRadio) autoRadio.checked = automatic;
+  const manualRadio = $("mood-mode-manual");
+  if (manualRadio) manualRadio.checked = !automatic;
+  const autoLabel = $("mood-mode-auto-label");
+  if (autoLabel) autoLabel.classList.toggle("is-selected", automatic);
+  const manualLabel = $("mood-mode-manual-label");
+  if (manualLabel) manualLabel.classList.toggle("is-selected", !automatic);
+  refreshButtons();
+  saveState();
+  if (state.audio) {
+    setStatus("Style updated — click Generate Audiobook to apply it.", "info");
+  }
+}
+
 function buildPreferences() {
-  const base = STYLE_PRESETS[state.style].preferences;
+  const base =
+    state.moodMode === "auto"
+      ? AUTO_MOOD.preferences
+      : STYLE_PRESETS[state.style].preferences;
   const preferences = JSON.parse(JSON.stringify(base));
   if (state.languageOverride) {
     // The director model receives this as plain direction — no new API calls.
     preferences.custom_direction = `Narrate the audiobook in ${state.languageOverride}.`;
   }
   return preferences;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Whole-story analysis (AI Narration Director)                               */
+/* ------------------------------------------------------------------------- */
+/*   POST /projects/{id}/analyze-story   whole-story directing analysis (aux)
+ *   GET  /projects/{id}/story-analysis  the saved analysis, or 404
+ *
+ * The analysis is CONTEXT for the planner. The user can accept the
+ * recommendation or keep their own profile — the recommendation is shown only
+ * after it exists, never invented in the browser.
+ */
+function storyAnalysisKey() {
+  if (!state.project) return null;
+  return `${state.project.id}:${state.project.characterCount || 0}`;
+}
+
+function resetStoryAnalysis() {
+  state.storyAnalysis = null;
+  state.analysisKey = null;
+  state.analysisStatus = "idle";
+  state.analysisStatusText = "";
+  if (state.preview.url) {
+    URL.revokeObjectURL(state.preview.url);
+  }
+  state.preview = { status: "idle", url: null, error: null };
+  const player = $("preview-player");
+  if (player) {
+    if (typeof player.pause === "function") player.pause();
+    if (typeof player.removeAttribute === "function") {
+      player.removeAttribute("src");
+    }
+    player.classList.add("hidden");
+  }
+  const status = $("analysis-status");
+  if (status) status.textContent = "";
+  renderStoryAnalysis();
+}
+
+function profileLabel(profileId) {
+  if (!profileId) return "";
+  const preset = STYLE_PRESETS[profileId];
+  return preset ? preset.label : profileId;
+}
+
+function renderStoryAnalysis() {
+  const panel = $("story-analysis-panel");
+  const analysis = state.storyAnalysis;
+  if (!panel) return;
+  panel.classList.toggle("hidden", !analysis);
+  if (!analysis) return;
+
+  const genre = analysis.secondary_genre
+    ? `${analysis.primary_genre} · ${analysis.secondary_genre}`
+    : analysis.primary_genre;
+  $("analysis-genre").textContent = genre || "—";
+  $("analysis-profile").textContent =
+    profileLabel(analysis.recommended_profile) || "—";
+  $("analysis-mood").textContent = analysis.dominant_mood || "—";
+  $("analysis-language").textContent = analysis.language || "—";
+  $("analysis-direction").textContent = analysis.recommended_direction || "";
+
+  const list = $("analysis-scenes");
+  list.innerHTML = "";
+  (analysis.scene_progression || []).forEach((scene) => {
+    const item = document.createElement("li");
+    item.className = "analysis-scene";
+    const range = `${scene.start_paragraph_index + 1}–${
+      scene.end_paragraph_index + 1
+    }`;
+    const mood = document.createElement("span");
+    mood.className = "analysis-scene-mood";
+    mood.textContent = scene.mood;
+    const meta = document.createElement("span");
+    meta.className = "analysis-scene-meta";
+    meta.textContent = `¶${range} · intensity ${scene.intensity}`;
+    item.append(mood, meta);
+    if (scene.summary) {
+      const summary = document.createElement("p");
+      summary.className = "analysis-scene-summary";
+      summary.textContent = scene.summary;
+      item.append(summary);
+    }
+    list.append(item);
+  });
+
+  const recommended = $("btn-use-recommended");
+  if (recommended) {
+    const known = Boolean(STYLE_PRESETS[analysis.recommended_profile]);
+    recommended.disabled = !known;
+    recommended.textContent = known
+      ? `Use ${profileLabel(analysis.recommended_profile)}`
+      : "Use recommended style";
+  }
+  const status = $("analysis-status");
+  if (status && state.analysisStatus === "ready") {
+    status.textContent = state.analysisStatusText || "";
+  }
+  refreshButtons();
+}
+
+function setAnalysisStatus(text, status) {
+  const node = $("analysis-status");
+  state.analysisStatus = status;
+  if (state.analysisStatus !== "ready") state.analysisStatusText = "";
+  else state.analysisStatusText = text || "";
+  if (node) node.textContent = text || "";
+  refreshButtons();
+}
+
+async function analyzeStory() {
+  if (!state.project) throw new Error("Upload a script first.");
+  setAnalysisStatus("Reading your whole story…", "loading");
+  try {
+    const data = await jsonRequest(
+      "POST",
+      `/projects/${state.project.id}/analyze-story`,
+      { force: false }
+    );
+    state.storyAnalysis = data.analysis;
+    state.analysisKey = storyAnalysisKey();
+    setAnalysisStatus(
+      data.reused
+        ? "Analysis loaded from the saved copy."
+        : "Analysis ready — you can use the recommendation or choose your own style.",
+      "ready"
+    );
+    renderStoryAnalysis();
+    saveState();
+  } catch (error) {
+    state.storyAnalysis = null;
+    state.analysisKey = null;
+    setAnalysisStatus(detailOf(error), "error");
+    renderStoryAnalysis();
+    throw error;
+  }
+}
+
+async function loadStoryAnalysis() {
+  if (!state.project) return;
+  const key = storyAnalysisKey();
+  if (state.storyAnalysis && state.analysisKey === key) {
+    renderStoryAnalysis();
+    return;
+  }
+  try {
+    const data = await api(`/projects/${state.project.id}/story-analysis`);
+    state.storyAnalysis = data.analysis;
+    state.analysisKey = key;
+    setAnalysisStatus("Saved analysis loaded.", "ready");
+    renderStoryAnalysis();
+  } catch (error) {
+    if (!(error && error.status === 404)) {
+      console.warn("Could not load the story analysis:", error);
+    }
+    state.storyAnalysis = null;
+    state.analysisKey = null;
+    setAnalysisStatus("", "idle");
+    renderStoryAnalysis();
+  }
+}
+
+function useRecommendedStyle() {
+  const analysis = state.storyAnalysis;
+  if (!analysis) return;
+  const style = analysis.recommended_profile;
+  if (!STYLE_PRESETS[style]) return;
+  selectStyle(style, true);
+  setStatus(
+    `Using ${STYLE_PRESETS[style].label} — you can still change it.`,
+    "info"
+  );
+}
+
+/* Optional narration preview: ONE paragraph, explicit click only. The backend
+ * classifies the endpoint as auxiliary, so no audiobook allowance is spent and
+ * nothing is written to the project's audiobook files. */
+async function previewNarration() {
+  if (!state.project) throw new Error("Upload a script first.");
+  const button = $("btn-narration-preview");
+  const player = $("preview-player");
+  state.preview.status = "loading";
+  if (button) button.textContent = "Rendering preview…";
+  refreshButtons();
+  try {
+    const response = await fetch(
+      `/projects/${state.project.id}/narration-preview/audio`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paragraph_index: 0,
+          preferences: buildPreferences(),
+        }),
+      }
+    );
+    if (!response.ok) {
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (_) {
+        /* non-JSON error body */
+      }
+      const error = new Error(
+        detailOf(payload || { detail: `HTTP ${response.status}` })
+      );
+      error.status = response.status;
+      if (response.status === 401) window.location.href = "/auth/login";
+      throw error;
+    }
+    const blob = await response.blob();
+    if (state.preview.url) URL.revokeObjectURL(state.preview.url);
+    const url = URL.createObjectURL(blob);
+    state.preview = { status: "ready", url, error: null };
+    if (player) {
+      player.src = url;
+      player.classList.remove("hidden");
+      if (typeof player.play === "function") {
+        player.play().catch(() => {
+          /* autoplay may be blocked — the user can press play */
+        });
+      }
+    }
+    setStatus(
+      "Preview ready — this sample used the auxiliary preview, not your audiobook allowance.",
+      "ok"
+    );
+  } catch (error) {
+    state.preview.status = "error";
+    state.preview.error = detailOf(error);
+    setStatus(`Preview failed: ${detailOf(error)}`, "error");
+    throw error;
+  } finally {
+    if (button) button.textContent = "Preview the narration";
+    refreshButtons();
+  }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -589,10 +959,11 @@ function buildPreferences() {
  */
 const AUDITION_LINE =
   "Hello, this is a short preview of my voice for this audiobook.";
-/* Mirrors the server's default duplicate window (BETA_DUPLICATE_WINDOW_SECONDS):
- * after a SUCCESSFUL preview the next click waits instead of tripping the
- * backend's duplicate-submission guard. The server stays authoritative — a
- * 409 is still surfaced with a retry action. */
+/* Mirrors the server's duplicate window (BETA_DUPLICATE_WINDOW_SECONDS) PER
+ * speaker+voice: re-previewing the SAME voice waits instead of tripping the
+ * backend's duplicate-submission guard, while switching to another voice is
+ * always allowed immediately. The server stays authoritative — a 409 is
+ * still surfaced with a retry action. */
 const AUDITION_COOLDOWN_MS = 10 * 1000;
 const DUPLICATE_REQUEST_RE = /Duplicate submission|already being processed/i;
 const AUDITION_LABELS = {
@@ -1003,8 +1374,9 @@ function renderAuditionButtons() {
     const status =
       (state.casting.auditions[id] || { status: "idle" }).status || "idle";
     button.textContent = AUDITION_LABELS[status] || AUDITION_LABELS.idle;
-    button.disabled =
-      status === "loading" || state.casting.auditionBusy || state.casting.busy;
+    // Only THIS speaker's button is busy while its preview loads — other
+    // voices stay previewable at any time (switching is never blocked).
+    button.disabled = status === "loading" || state.casting.busy;
   });
 }
 
@@ -1032,6 +1404,7 @@ function invalidateCasting(options = {}) {
 }
 
 function stopAllPreviews() {
+  state.casting.auditionSeq += 1; // any in-flight preview is discarded
   Object.keys(state.casting.auditions).forEach((id) => {
     const current = state.casting.auditions[id];
     try {
@@ -1283,10 +1656,6 @@ async function previewVoice(speakerId) {
   if (!state.project || state.casting.busy) return;
   const auditions = state.casting.auditions;
   const current = auditions[speakerId] || { status: "idle" };
-  if (state.casting.auditionBusy || current.status === "loading") {
-    setStatus("A voice preview is already being generated — please wait.", "info");
-    return;
-  }
   if (current.status === "playing") {
     stopAudition(speakerId);
     return;
@@ -1297,31 +1666,43 @@ async function previewVoice(speakerId) {
     setStatus("No voice is available to preview for this role yet.", "error");
     return;
   }
+  if (current.status === "loading") {
+    if (current.voiceId === voiceId) {
+      // The exact same preview is already on its way — don't submit twice.
+      setStatus("A voice preview is already being generated — please wait.", "info");
+      return;
+    }
+    // Switching voices mid-load is allowed: the stale fetch is discarded.
+  }
+  const cooldownKey = `${speakerId}:${voiceId}`;
   const now = Date.now();
-  if (
-    current.status !== "error" &&
-    state.casting.lastAuditionAt &&
-    now - state.casting.lastAuditionAt < AUDITION_COOLDOWN_MS
-  ) {
-    // A successful preview just ran — the backend would answer409 here.
-    setStatus("Please wait a moment before previewing another voice.", "info");
+  const lastAt = state.casting.auditionCooldowns[cooldownKey] || 0;
+  if (now - lastAt < AUDITION_COOLDOWN_MS) {
+    // This exact voice preview just ran — the backend would answer 409 here.
+    // ANOTHER voice is a different submission and is never blocked.
+    setStatus("Please wait a moment before previewing this voice again.", "info");
     return;
   }
+  // A new preview always stops whatever is playing or loading elsewhere —
+  // one preview at a time, but switching is instant and never blocked.
+  stopOtherPreviews(speakerId);
   const key = castingKey();
-  state.casting.auditionBusy = true;
-  auditions[speakerId] = { status: "loading" };
+  const token = (state.casting.auditionSeq += 1);
+  auditions[speakerId] = { status: "loading", voiceId };
   renderAuditionButtons();
   try {
     const blob = await fetchAudition(speakerId, voiceId);
+    if (token !== state.casting.auditionSeq) return; // superseded mid-fetch
     if (castingKey() !== key) return; // script replaced mid-preview
     const objectUrl = URL.createObjectURL(blob);
     const audio = new Audio(objectUrl);
     audio.onended = () => {
-      if (state.casting.auditions[speakerId] && state.casting.auditions[speakerId].url === objectUrl) {
+      const entry = state.casting.auditions[speakerId];
+      if (entry && entry.url === objectUrl) {
         stopAudition(speakerId, { silent: true });
       }
     };
-    auditions[speakerId] = { status: "playing", url: objectUrl, audio };
+    auditions[speakerId] = { status: "playing", url: objectUrl, audio, voiceId };
     renderAuditionButtons();
     const played = audio.play();
     if (played && typeof played.catch === "function") {
@@ -1329,18 +1710,19 @@ async function previewVoice(speakerId) {
         auditions[speakerId] = {
           status: "error",
           error: "The preview could not start playing.",
+          voiceId,
         };
         renderAuditionButtons();
       });
     }
-    state.casting.lastAuditionAt = Date.now();
+    state.casting.auditionCooldowns[cooldownKey] = Date.now();
     setStatus("Playing the voice preview.", "ok");
   } catch (error) {
-    auditions[speakerId] = { status: "error", error: detailOf(error) };
+    if (token !== state.casting.auditionSeq) return; // superseded mid-fetch
+    auditions[speakerId] = { status: "error", error: detailOf(error), voiceId };
     setStatus(detailOf(error), "error");
     console.error("Voice preview failed:", error);
   } finally {
-    state.casting.auditionBusy = false;
     renderAuditionButtons();
   }
 }
@@ -1361,6 +1743,13 @@ function stopAudition(speakerId, options = {}) {
   state.casting.auditions[speakerId] = { status: "idle" };
   renderAuditionButtons();
   if (!options.silent) setStatus("Voice preview stopped.", "info");
+}
+
+/** Stop (and reset) every preview except one speaker's. */
+function stopOtherPreviews(exceptSpeakerId) {
+  Object.keys(state.casting.auditions).forEach((id) => {
+    if (id !== exceptSpeakerId) stopAudition(id, { silent: true });
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1636,6 +2025,8 @@ async function generate() {
             throw error;
           }
         }
+        // Show the directing analysis the server used (free GET, no new call).
+        await loadStoryAnalysis();
       }
 
       setStatus(
@@ -1696,6 +2087,8 @@ async function generate() {
         state.project.language = plan.language;
         renderSummary();
       }
+      // Show the directing analysis the server used (free GET, no new call).
+      await loadStoryAnalysis();
     }
     setStage("understand", "done");
 
@@ -1848,14 +2241,23 @@ async function restore() {
     if (!project) return;
   }
 
-  state.style = saved && STYLE_PRESETS[saved.style] ? saved.style : "natural";
+  state.style = normalizeStyleId(saved && saved.style);
+  state.moodMode = saved && saved.moodMode === "manual" ? "manual" : "auto";
   state.languageOverride = (saved && saved.languageOverride) || "";
   state.project = project;
   state.planKey = (saved && saved.planKey) || null;
   state.audio = (saved && saved.audio) || null;
   state.characterCount = project.characterCount || 0;
+  // The analysis is a server artefact; localStorage is only a display cache.
+  state.storyAnalysis =
+    saved && saved.analysisKey === storyAnalysisKey()
+      ? saved.storyAnalysis || null
+      : null;
+  state.analysisKey = state.storyAnalysis ? storyAnalysisKey() : null;
   $("language-select").value = state.languageOverride;
+  selectMoodMode(state.moodMode);
   selectStyle(state.style);
+  renderStoryAnalysis();
 
   try {
     await api(`/projects/${state.project.id}`);
@@ -1878,6 +2280,10 @@ async function restore() {
   if (state.project.fromServer) {
     await hydrateScriptSummary(state.project);
   }
+
+  // A saved whole-story analysis is server-authoritative; show it if it still
+  // describes the current script (GET is free and never triggers a MiMo call).
+  await loadStoryAnalysis();
 
   // Casting state: the cast itself is server-authoritative (GET voice-casting);
   // only the analysis display comes from the local cache.
@@ -1955,6 +2361,7 @@ async function boot() {
   }
 
   try {
+    selectMoodMode(state.moodMode);
     selectStyle(state.style);
     refreshButtons();
   } catch (error) {

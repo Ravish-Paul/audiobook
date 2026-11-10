@@ -371,3 +371,88 @@ def test_live_mimo_narration_analysis(
     saved = client.get(f"/projects/{project_with_script}/narration-plan")
     assert saved.status_code == 200
     assert saved.json()["paragraphs"] == body["paragraphs"]
+
+
+# --------------------------------------------------------------------------- #
+# Long scripts (5k words): planned in batches, merged and re-checked
+# --------------------------------------------------------------------------- #
+class _BatchEchoMiMo:
+    """Answers every batch with a valid plan for exactly its numbered
+    paragraphs (GLOBAL `paragraph_index` values, text untouched).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    def complete_json(self, *, system: str, user: str) -> str:
+        self.calls.append({"system": system, "user": user})
+        marker = "Script paragraphs (copy each `text` into `original_text` exactly):\n"
+        remainder = user.split(marker, 1)[1]
+        numbered, _ = json.JSONDecoder().raw_decode(remainder.lstrip())
+        plan = make_plan_dict([item["text"] for item in numbered])
+        for paragraph, item in zip(plan["paragraphs"], numbered):
+            paragraph["paragraph_index"] = item["paragraph_index"]
+        return json.dumps(plan, ensure_ascii=False)
+
+
+def test_long_scripts_are_planned_in_batches_and_merged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 5k-word manuscript plans in small batches (GLOBAL paragraph indices)
+    and the merged plan covers every paragraph — one response can never
+    overflow the completion budget and truncate into an invalid plan.
+    """
+    from app.services.narration_planner import (
+        MAX_BATCH_CHARACTERS,
+        MAX_BATCH_PARAGRAPHS,
+    )
+
+    filler = (
+        "The old lamp flickered on the platform while the night train waited "
+        "in the rain, carrying tired passengers and their quiet untold stories "
+        "onward through the dark hours of the long journey home again, while "
+        "somewhere behind the windows a slow song kept playing softly on."
+    )
+    texts = [f"{filler} Segment {index}." for index in range(165)]
+    script = "\n\n".join(texts)
+    assert len(script.split()) >= 5000, "the fixture really is a 5k-word script"
+
+    project = client.post("/projects", json={"name": "Long Script"}).json()[
+        "project_id"
+    ]
+    upload = client.post(
+        f"/projects/{project}/upload-script",
+        files={"file": ("script.txt", script.encode("utf-8"), "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+
+    fake = _BatchEchoMiMo()
+    _use_fake_mimo(monkeypatch, fake)
+    body = _analyze(client, project)
+
+    # The merged plan covers every paragraph, in order, with global indices
+    # and the script text byte-for-byte.
+    assert body["paragraph_count"] == len(texts)
+    assert [p["paragraph_index"] for p in body["paragraphs"]] == list(
+        range(len(texts))
+    )
+    assert [p["original_text"] for p in body["paragraphs"]] == texts
+
+    # …and no single MiMo call was ever asked for the whole script.
+    assert fake.calls, "the planner called MiMo"
+    assert len(fake.calls) > 1, "long scripts are split into batches"
+    seen: set[int] = set()
+    for call in fake.calls:
+        assert "This is one BATCH of a longer script" in call["user"]
+        marker = "Script paragraphs (copy each `text` into `original_text` exactly):\n"
+        numbered, _ = json.JSONDecoder().raw_decode(
+            call["user"].split(marker, 1)[1].lstrip()
+        )
+        assert len(numbered) <= MAX_BATCH_PARAGRAPHS
+        assert sum(len(item["text"]) for item in numbered) <= MAX_BATCH_CHARACTERS
+        for item in numbered:
+            index = item["paragraph_index"]
+            assert index not in seen, "batches never overlap"
+            seen.add(index)
+            assert item["text"] == texts[index], "global numbering is exact"
+    assert seen == set(range(len(texts))), "every paragraph was planned"

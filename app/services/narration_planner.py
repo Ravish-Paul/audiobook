@@ -37,10 +37,12 @@ from app.schemas.narration import (
 )
 from app.schemas.narration_preferences import (
     PRESET_LABELS,
+    PROFILE_GUIDANCE,
     TAG_DENSITY_LABELS,
     NarrationPreferences,
     NarrationPreferencesResponse,
 )
+from app.schemas.story_analysis import StoryDirectorAnalysis
 from app.services.eleven_models import get_capabilities
 from app.services.errors import (
     EmptyScriptError,
@@ -63,6 +65,14 @@ _BLANK_LINES = re.compile(r"\n\s*\n+")
 
 MAX_DIRECTION_CHARS = 1000
 
+# Long scripts are planned in BATCHES so a single response can never overflow
+# the model's completion budget (the plan JSON echoes every paragraph's text
+# twice — `original_text` + `tts_text`). Each batch keeps the GLOBAL paragraph
+# indices; the batches are merged and re-validated against the whole script.
+# Small scripts stay ONE batch (one MiMo call — unchanged behaviour).
+MAX_BATCH_PARAGRAPHS = 6
+MAX_BATCH_CHARACTERS = 2200
+
 
 def split_paragraphs(script: str) -> list[str]:
     """Split a script into paragraphs, preserving each paragraph's text.
@@ -77,6 +87,31 @@ def split_paragraphs(script: str) -> list[str]:
         if len(lines) > 1:
             blocks = lines
     return blocks
+
+
+def split_batches(paragraphs: Sequence[str]) -> list[tuple[int, list[str]]]:
+    """Split a script into (global offset, paragraphs) planning batches.
+
+    Bounded by paragraph count AND character count; a single paragraph longer
+    than the character budget simply becomes its own batch.
+    """
+    batches: list[tuple[int, list[str]]] = []
+    start = 0
+    batch_chars = 0
+    for index, text in enumerate(paragraphs):
+        if (
+            index > start
+            and (
+                index - start >= MAX_BATCH_PARAGRAPHS
+                or batch_chars + len(text) > MAX_BATCH_CHARACTERS
+            )
+        ):
+            batches.append((start, list(paragraphs[start:index])))
+            start = index
+            batch_chars = 0
+        batch_chars += len(text)
+    batches.append((start, list(paragraphs[start:])))
+    return batches
 
 
 # --------------------------------------------------------------------------- #
@@ -119,12 +154,16 @@ AUDIO TAGS (`tts_text` — Eleven v4 inline delivery tags)
 17. Use Eleven v4 audio tags only. NEVER emit SSML such as <break time="1s"/> — Eleven v4 does not support SSML; use tags, ellipses (...) and punctuation instead.
 18. The script language (Hindi, English, …) never changes; tags stay short English delivery cues even for Hindi scripts.
 
-DELIVERY STYLE vs NARRATION PRESET (never confuse the two)
-19. The NARRATION PRESETS (natural, restrained_cinematic, expressive, dramatic) are GLOBAL directions for the whole book. A preset name is NEVER a valid `delivery_style` value.
+DELIVERY STYLE vs NARRATION PROFILE (never confuse the two)
+19. The NARRATION PROFILE is the GLOBAL creative direction for the whole book. A profile name is NEVER a valid `delivery_style` value.
 20. `delivery_style` must be exactly one of: {", ".join(DELIVERY_STYLES)}. Never invent a new delivery_style — a value outside this list invalidates the whole plan.
-21. Never return "cinematic", "natural" or "expressive" as `delivery_style`: those are preset names, not paragraph styles.
+21. Never return a profile name (natural, cinematic, horror, romantic, sensual, emotional, action, mystery, fantasy, comedy, professional, children, auto) as `delivery_style`: those are global directions, not paragraph styles.
 22. Choose `delivery_style` separately for each paragraph, based on the scene. Prefer calm or conversational for ordinary narration. Use mysterious or soft only when the scene justifies it.
-23. The cinematic (restrained_cinematic) preset does NOT mean dramatic delivery: it is atmosphere through pacing, polish and restraint. Do not reach for dramatic or intense delivery just because the preset is cinematic.
+23. A cinematic profile does NOT mean dramatic delivery on every line: it is atmosphere through pacing, polish and restraint.
+
+SCENE AND PARAGRAPH CONTEXT
+24. Where the script lets you identify a scene or beat, fill the OPTIONAL metadata `scene_id`, `scene_purpose` and `pacing` (short strings). They are planning notes, never spoken.
+25. Do not assign the same emotion, direction or intensity to every paragraph. Neutral narration stays neutral. Apply the global profile as an overall boundary, not as a mood stamp on each paragraph — a horror story still has calm passages, and a sensual romance still has ordinary conversation, conflict and neutral narration.
 
 ALLOWED VALUES
 - emotion (exactly one): {", ".join(EMOTIONS)}
@@ -149,6 +188,9 @@ Return ONLY one valid JSON object (no markdown fences, no commentary) with exact
       "delivery_style": "<exactly one of: {", ".join(DELIVERY_STYLES)} — never a preset name such as cinematic/natural/expressive>",
       "intensity": 1,
       "narration_direction": "<short direction>",
+      "scene_id": "<optional: scene/beat identifier>",
+      "scene_purpose": "<optional: what this paragraph does in the scene>",
+      "pacing": "<optional: pacing intention>",
       "voice_settings": {{
         "speed": 1.0, "stability": 0.5, "similarity_boost": 0.75,
         "style": 0.0, "use_speaker_boost": true
@@ -159,24 +201,10 @@ Return ONLY one valid JSON object (no markdown fences, no commentary) with exact
 }}"""
 
 
-# What each preset means, so the model never has to guess.
-PRESET_RULES: dict[str, str] = {
-    "natural": (
-        "natural, controlled human storytelling; subtle emotion; no "
-        "theatrical extremes, no shouting/trembling/breathless delivery"
-    ),
-    "restrained_cinematic": (
-        "restrained cinematic tone: atmosphere over performance; measured, "
-        "polished and still natural"
-    ),
-    "expressive": (
-        "expressive and lively where the story earns it, but never overacted"
-    ),
-    "dramatic": (
-        "heightened dramatic staging is welcome; strong emphasis is allowed "
-        "where the scene supports it"
-    ),
-}
+# What each preset means, so the model never has to guess. The twelve global
+# profiles live in `narration_preferences.PROFILE_GUIDANCE`; this alias keeps
+# the historical name used by the prompt builder and by external importers.
+PRESET_RULES: dict[str, str] = dict(PROFILE_GUIDANCE)
 
 
 def _voice_settings_rules(capabilities: Any) -> str:
@@ -271,12 +299,132 @@ def _preferences_block(
     return "\n".join(lines)
 
 
+def effective_profile(
+    preferences: Optional[Any],
+    story_analysis: Optional[StoryDirectorAnalysis] = None,
+) -> Optional[str]:
+    """The concrete profile the plan must follow.
+
+    `auto` is resolved from the story analysis' recommendation. Without an
+    analysis (legacy/manual callers) it stays `auto` so the AI-automatic rules
+    still apply.
+    """
+    if preferences is None:
+        return None
+    preset = getattr(preferences, "preset", None)
+    if preset == "auto" and story_analysis is not None:
+        recommended = story_analysis.recommended_profile
+        if recommended:
+            return recommended
+    return preset
+
+
+def preferences_for_profile(
+    preferences: Optional[NarrationPreferences],
+    story_analysis: Optional[StoryDirectorAnalysis] = None,
+) -> Optional[NarrationPreferences]:
+    """A copy of the preferences with `auto` resolved for prompt/policy use.
+
+    The persisted preferences keep `auto` (the user's choice); the concrete
+    profile only affects the actual planning and policy budgets.
+    """
+    if preferences is None:
+        return None
+    profile = effective_profile(preferences, story_analysis)
+    if profile is None or profile == preferences.preset:
+        return preferences
+    return preferences.model_copy(update={"preset": profile})
+
+
+def _story_analysis_block(
+    story_analysis: Optional[StoryDirectorAnalysis],
+    preferences: Optional[Any],
+    resolved_profile: Optional[str],
+) -> str:
+    """Render the whole-story analysis as *context* for the director.
+
+    The analysis must never become a blunt per-paragraph command: the source
+    script and the scene itself always win.
+    """
+    if story_analysis is None:
+        return ""
+    scenes = "; ".join(
+        f"{scene.start_paragraph_index}-{scene.end_paragraph_index}: "
+        f"{scene.mood} (intensity {scene.intensity})"
+        for scene in story_analysis.scene_progression[:24]
+    )
+    tendencies = "; ".join(
+        f"{item.character_name}: {item.tendency}"
+        for item in story_analysis.character_tendencies[:16]
+    )
+    preset = getattr(preferences, "preset", None)
+    extra_lines: list[str] = []
+    if preset == "auto":
+        profile_line = (
+            f"- recommended global profile (chosen by AI Automatic analysis): "
+            f"{PRESET_LABELS.get(resolved_profile or '', resolved_profile)}"
+        )
+        # The RESOLVED profile must reach the prompt as real guidance — a
+        # label alone does not tell the model where horror/sensual/…
+        # boundaries are. (Manual mode already renders its chosen profile's
+        # guidance through the preferences block.)
+        resolved_guidance = PROFILE_GUIDANCE.get(resolved_profile or "", "")
+        if resolved_guidance:
+            extra_lines = [
+                f"- global profile boundary (apply this as the direction): "
+                f"{resolved_guidance}"
+            ]
+        authority = (
+            "- The user chose 'Let AI choose based on my story' (AI Automatic "
+            "mode). This is an AI-automatic mood: follow the recommended "
+            "profile as the GLOBAL direction, then choose each paragraph's "
+            "mood and delivery to fit that scene. Never apply one mood "
+            "everywhere."
+        )
+    else:
+        profile_line = (
+            f"- AI recommendation (the user OVERRODE it with "
+            f"{PRESET_LABELS.get(preset or '', preset)}): "
+            f"{PRESET_LABELS.get(story_analysis.recommended_profile, story_analysis.recommended_profile)}"
+        )
+        authority = (
+            "- Manual mode: the user's chosen global profile WINS over the "
+            "recommendation. Use the analysis only as story context. The "
+            "chosen profile is a GLOBAL boundary — it never forces one mood "
+            "onto every paragraph."
+        )
+    lines = [
+        "WHOLE-STORY ANALYSIS (context, not a script rewrite)",
+        f"- primary genre: {story_analysis.primary_genre}"
+        + (
+            f"; secondary genre: {story_analysis.secondary_genre}"
+            if story_analysis.secondary_genre
+            else ""
+        ),
+        f"- emotional tone: {story_analysis.emotional_tone}",
+        f"- dominant mood: {story_analysis.dominant_mood}",
+        f"- language: {story_analysis.language}",
+        f"- intimacy level: {story_analysis.intimacy_level}",
+        profile_line,
+        *extra_lines,
+        f"- scene progression: {scenes or 'not stated'}",
+        f"- character tendencies: {tendencies or 'not stated'}",
+        f"- recommended direction: {story_analysis.recommended_direction}",
+        authority,
+        "- IMPORTANT: this is guidance for the story as a whole. Preserve "
+        "neutral narration, let the mood change between scenes, and never "
+        "apply the dominant mood to every paragraph.",
+    ]
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     preferences: Optional[Any] = None,
     capabilities: Any = None,
     paragraph_count: Optional[int] = None,
+    story_analysis: Optional[StoryDirectorAnalysis] = None,
 ) -> str:
-    """Base natural-delivery rules + user preferences + model capabilities.
+    """Base natural-delivery rules + user preferences + story analysis + caps.
 
     `preferences=None` still yields the anti-overacting rules — they are not
     optional; only the preference-specific budgets are skipped.
@@ -293,6 +441,11 @@ def build_system_prompt(
     preferences_block = _preferences_block(preferences, paragraph_count)
     if preferences_block:
         parts += ["", preferences_block]
+    analysis_block = _story_analysis_block(
+        story_analysis, preferences, effective_profile(preferences, story_analysis)
+    )
+    if analysis_block:
+        parts += ["", analysis_block]
     return "\n".join(parts)
 
 
@@ -305,10 +458,18 @@ def build_user_prompt(
     paragraphs: Sequence[str],
     feedback: Optional[Sequence[str]] = None,
     preferences: Optional[Any] = None,
+    *,
+    index_offset: int = 0,
+    total_paragraphs: Optional[int] = None,
+    story_analysis: Optional[StoryDirectorAnalysis] = None,
 ) -> str:
-    """Render the numbered script (JSON, so Hindi/line breaks survive)."""
+    """Render the numbered script (JSON, so Hindi/line breaks survive).
+
+    `index_offset` keeps the numbering continuous across batches — MiMo must
+    see (and return) the exact `paragraph_index` values of the full script.
+    """
     numbered = [
-        {"paragraph_index": index, "text": text}
+        {"paragraph_index": index_offset + index, "text": text}
         for index, text in enumerate(paragraphs)
     ]
     parts = [
@@ -316,6 +477,16 @@ def build_user_prompt(
         "narration plan as one JSON object.",
         "",
         f"Total paragraphs: {len(paragraphs)}",
+    ]
+    total = total_paragraphs or len(paragraphs)
+    if index_offset > 0 or total != len(paragraphs):
+        parts.append(
+            f"This is one BATCH of a longer script: it covers paragraph_index "
+            f"{index_offset}..{index_offset + len(paragraphs) - 1} out of "
+            f"{total}. Use these exact paragraph_index values — never "
+            "renumber them."
+        )
+    parts += [
         "",
         "delivery_style is a per-paragraph choice from exactly this closed "
         "list (never invent a value, never use the global preset names "
@@ -336,6 +507,11 @@ def build_user_prompt(
                 preferences.model_dump(mode="json"), ensure_ascii=False, indent=2
             ),
         ]
+    analysis_block = _story_analysis_block(
+        story_analysis, preferences, effective_profile(preferences, story_analysis)
+    )
+    if analysis_block:
+        parts += ["", analysis_block]
     if feedback:
         parts += [
             "",
@@ -403,6 +579,23 @@ EMOTION_ALIASES: dict[str, str] = {
     "confidently": "confidence",
     "tender": "tenderness",
     "tenderly": "tenderness",
+    # Scene-aware additions: morphological variants of the exact enum members.
+    "grief": "grieving",
+    "grievingly": "grieving",
+    "relief": "relieved",
+    "hope": "hopeful",
+    "hopefully": "hopeful",
+    "vulnerability": "vulnerable",
+    "nervousness": "nervous",
+    "nervously": "nervous",
+    "suspicion": "suspicious",
+    "suspiciously": "suspicious",
+    "playfulness": "playful",
+    "playfully": "playful",
+    "intimacy": "intimate",
+    "intimately": "intimate",
+    "urgency": "urgent",
+    "urgently": "urgent",
 }
 
 
@@ -477,9 +670,17 @@ def normalize_plan_payload(data: Any) -> tuple[Any, list[str]]:
 
 
 def validate_against_script(
-    plan: NarrationPlan, expected: Sequence[str]
+    plan: NarrationPlan,
+    expected: Sequence[str],
+    *,
+    index_offset: int = 0,
 ) -> list[str]:
-    """Cross-check the plan against the uploaded script. Returns problems."""
+    """Cross-check the plan against the uploaded script. Returns problems.
+
+    `index_offset` is the GLOBAL paragraph index of `expected[0]` — used to
+    validate one batch of a longer script; the plan's paragraphs always carry
+    their global `paragraph_index`.
+    """
     from app.services.audio_tags import validate_tts_text
 
     problems: list[str] = []
@@ -489,7 +690,7 @@ def validate_against_script(
     if duplicates:
         problems.append(f"duplicate paragraph_index value(s): {duplicates}")
 
-    expected_indices = list(range(len(expected)))
+    expected_indices = list(range(index_offset, index_offset + len(expected)))
     if sorted(indices) != expected_indices:
         missing = sorted(set(expected_indices) - set(indices))
         extra = sorted(set(indices) - set(expected_indices))
@@ -499,7 +700,8 @@ def validate_against_script(
             problems.append(f"unknown paragraph_index value(s): {extra}")
 
     by_index = {p.paragraph_index: p for p in plan.paragraphs}
-    for index, text in enumerate(expected):
+    for position, text in enumerate(expected):
+        index = index_offset + position
         paragraph = by_index.get(index)
         if paragraph is None:
             continue
@@ -615,10 +817,18 @@ class NarrationPlanner:
         resolved = self._resolve_preferences(
             project_id, preferences, len(paragraphs)
         )
+        analysis = self._story_analysis_for(resolved, project_id)
         plan = self.build_plan(
-            paragraphs, preferences=resolved, project_id=project_id
+            paragraphs,
+            preferences=resolved,
+            project_id=project_id,
+            story_analysis=analysis,
         )
-        plan.preferences = resolved  # authoritative — never MiMo's echo
+        # The persisted snapshot is the user's choice (`auto` stays `auto`);
+        # the concrete profile is recorded separately for review.
+        plan.preferences = resolved
+        plan.story_analysis = analysis
+        plan.effective_profile = effective_profile(resolved, analysis)
         saved_at = self.projects.save_narration_plan(project_id, plan)
         return NarrationPlanResponse.from_plan(
             project_id, plan, saved=True, saved_at=saved_at, settings=self.settings
@@ -665,10 +875,17 @@ class NarrationPlanner:
         window = paragraphs[start:end]
         index_map = {position: start + position for position in range(len(window))}
 
+        analysis = self._story_analysis_for(resolved, project_id)
         plan = self.build_plan(
-            window, preferences=resolved, index_map=index_map, project_id=project_id
+            window,
+            preferences=resolved,
+            index_map=index_map,
+            project_id=project_id,
+            story_analysis=analysis,
         )
         plan.preferences = resolved
+        plan.story_analysis = analysis
+        plan.effective_profile = effective_profile(resolved, analysis)
         target_position = paragraph_index - start
         target = next(
             (
@@ -703,6 +920,62 @@ class NarrationPlanner:
             context_paragraph_indices=list(range(start, end)),
             saved=False,
         )
+
+    # ------------------------------------------------------------------ #
+    # Story analysis (automatic mode)
+    # ------------------------------------------------------------------ #
+    def _story_analysis_for(
+        self,
+        preferences: Optional[NarrationPreferences],
+        project_id: str,
+    ) -> Optional[StoryDirectorAnalysis]:
+        """Load (and, in automatic mode, create) the whole-story analysis.
+
+        Manual mode only reuses an existing analysis as context; it never
+        spends a MiMo call the user did not ask for. Automatic mode must be
+        driven by a real analysis, so it creates one when none exists.
+        """
+        from app.services.story_analysis_service import StoryAnalysisService
+
+        service = StoryAnalysisService(
+            self.settings,
+            project_service=self.projects,
+            mimo_client=self.mimo,
+        )
+        stored = service.load(project_id)
+        if stored is not None:
+            return stored
+        if preferences is not None and preferences.preset == "auto":
+            return service.analyze(project_id).analysis
+        return None
+
+    async def preview_audio(
+        self,
+        project_id: str,
+        paragraph_index: int,
+        preferences: Optional[NarrationPreferences] = None,
+    ) -> bytes:
+        """Render ONE representative paragraph to MP3 — never saved, never billed.
+
+        Reuses the aux narration-preview planner and the existing
+        capability-filtered ElevenLabs client. The output is returned to the
+        caller as bytes; no audiobook artefact, segment or metadata is written.
+        """
+        from app.services.elevenlabs_client import ElevenLabsClient
+
+        preview = self.preview(
+            project_id, paragraph_index, preferences=preferences
+        )
+        paragraph = preview.paragraph
+        spoken = paragraph.tts_text or paragraph.original_text
+        client = ElevenLabsClient(self.settings)
+        result = await client.synthesize_result(
+            paragraph.original_text,
+            preview.tts_voice_settings.settings,
+            tts_text=spoken,
+            output_format=self.settings.elevenlabs_output_format,
+        )
+        return result.audio
 
     # ------------------------------------------------------------------ #
     # Preferences (persisted per project)
@@ -793,28 +1066,122 @@ class NarrationPlanner:
         preferences: Optional[NarrationPreferences] = None,
         index_map: Optional[dict[int, int]] = None,
         project_id: Optional[str] = None,
+        story_analysis: Optional[StoryDirectorAnalysis] = None,
     ) -> NarrationPlan:
         """Call MiMo and validate/retry until the plan matches the script
         AND the user's narration preferences (whenever any are set).
 
-        Every raw MiMo response is preserved (attached to the raised error
-        and written to `mimo_debug/` when a project is known) so an invalid
-        value can always be traced back to the exact model output.
+        Long scripts are planned in BATCHES (GLOBAL paragraph indices, own
+        retry loop each), then merged and re-validated against the whole
+        script — the second, dual check. Every raw MiMo response is preserved
+        (attached to the raised error and written to `mimo_debug/` when a
+        project is known) so an invalid value can always be traced back to
+        the exact model output.
         """
         attempts = self.settings.mimo_max_attempts
         capabilities = get_capabilities(self.settings.elevenlabs_model_id)
+        planning_preferences = preferences_for_profile(preferences, story_analysis)
         system = build_system_prompt(
-            preferences, capabilities, paragraph_count=len(paragraphs)
+            preferences,
+            capabilities,
+            paragraph_count=len(paragraphs),
+            story_analysis=story_analysis,
         )
-        problems: list[str] = ["no response from MiMo"]
         raw_attempts: list[str] = []
         normalization_notes: list[str] = []
+        merged: list[ParagraphPlan] = []
+        language = ""
+        overall_story_tone = ""
+
+        for offset, batch in split_batches(paragraphs):
+            plan, problems = self._build_batch(
+                batch,
+                preferences=preferences,
+                planning_preferences=planning_preferences,
+                system=system,
+                index_offset=offset,
+                total_paragraphs=len(paragraphs),
+                index_map=index_map,
+                capabilities=capabilities,
+                raw_attempts=raw_attempts,
+                normalization_notes=normalization_notes,
+                story_analysis=story_analysis,
+            )
+            if plan is None:
+                self._persist_mimo_debug(
+                    project_id, raw_attempts, normalization_notes, problems
+                )
+                raise NarrationPlanError(
+                    problems,
+                    attempts,
+                    raw_responses=raw_attempts,
+                    normalization_notes=normalization_notes,
+                )
+            merged.extend(plan.paragraphs)
+            language = language or plan.language
+            overall_story_tone = overall_story_tone or plan.overall_story_tone
+
+        merged_plan = NarrationPlan(
+            overall_story_tone=overall_story_tone,
+            language=language,
+            paragraphs=merged,
+            preferences=preferences,
+            story_analysis=story_analysis,
+            effective_profile=effective_profile(preferences, story_analysis),
+        )
+
+        # Merged, whole-script check — a per-batch pass cannot see cross-batch
+        # problems, so the merged plan is validated a second time before it
+        # can ever be saved.
+        problems = validate_against_script(merged_plan, paragraphs)
+        problems += require_tts_text(merged_plan)
+        if problems:
+            self._persist_mimo_debug(
+                project_id, raw_attempts, normalization_notes, problems
+            )
+            raise NarrationPlanError(
+                problems,
+                attempts,
+                raw_responses=raw_attempts,
+                normalization_notes=normalization_notes,
+            )
+
+        self._persist_mimo_debug(
+            project_id, raw_attempts, normalization_notes, problems=[]
+        )
+        return merged_plan
+
+    def _build_batch(
+        self,
+        paragraphs: Sequence[str],
+        *,
+        preferences: Optional[NarrationPreferences],
+        planning_preferences: Optional[NarrationPreferences] = None,
+        system: str,
+        index_offset: int,
+        total_paragraphs: int,
+        index_map: Optional[dict[int, int]],
+        capabilities: Any,
+        raw_attempts: list[str],
+        normalization_notes: list[str],
+        story_analysis: Optional[StoryDirectorAnalysis] = None,
+    ) -> tuple[Optional[NarrationPlan], list[str]]:
+        """One batch's MiMo round trip + retries.
+
+        Returns `(plan, [])` on success and `(None, problems)` when the retry
+        budget is exhausted. Every raw response is appended to `raw_attempts`.
+        """
+        attempts = self.settings.mimo_max_attempts
+        problems: list[str] = ["no response from MiMo"]
 
         for attempt in range(1, attempts + 1):
             user = build_user_prompt(
                 paragraphs,
                 feedback=problems if attempt > 1 else None,
                 preferences=preferences,
+                index_offset=index_offset,
+                total_paragraphs=total_paragraphs,
+                story_analysis=story_analysis,
             )
             raw = self.mimo.complete_json(system=system, user=user)
             raw_attempts.append(raw)
@@ -843,36 +1210,33 @@ class NarrationPlanner:
                 continue
 
             plan.preferences = preferences
-            problems = validate_against_script(plan, paragraphs)
+            plan.story_analysis = story_analysis
+            plan.effective_profile = effective_profile(
+                preferences, story_analysis
+            )
+            problems = validate_against_script(
+                plan, paragraphs, index_offset=index_offset
+            )
             # `tts_text` presence is mandatory for NEW plans (requirement 2):
             # MiMo must always populate it, with tags only where needed.
             problems += require_tts_text(plan)
 
             # Policy validation runs LAST (after Pydantic + script checks) and
             # is never skipped when preferences are set: a violation is always
-            # fed back to MiMo instead of silently accepted.
-            if not problems and preferences is not None:
+            # fed back to MiMo instead of silently accepted. In `auto` mode the
+            # concrete profile's budgets apply (`planning_preferences`).
+            policy_preferences = planning_preferences or preferences
+            if not problems and policy_preferences is not None:
                 problems = NarrationPolicyValidator(
-                    preferences,
+                    policy_preferences,
                     capabilities=capabilities,
                     index_map=index_map,
                 ).validate(plan)
 
             if not problems:
-                self._persist_mimo_debug(
-                    project_id, raw_attempts, normalization_notes, problems=[]
-                )
-                return plan
+                return plan, []
 
-        self._persist_mimo_debug(
-            project_id, raw_attempts, normalization_notes, problems=problems
-        )
-        raise NarrationPlanError(
-            problems,
-            attempts,
-            raw_responses=raw_attempts,
-            normalization_notes=normalization_notes,
-        )
+        return None, problems
 
     def _persist_mimo_debug(
         self,

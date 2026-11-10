@@ -491,6 +491,69 @@ class ProjectService:
         return preferences, saved_at
 
     # ------------------------------------------------------------------ #
+    # Whole-story narration analysis (AI Narration Director)
+    # ------------------------------------------------------------------ #
+    def story_analysis_path(self, project_id: str) -> Path:
+        """storage/projects/{project_id}/story_analysis.json"""
+        return self._project_dir(project_id) / self.settings.story_analysis_filename
+
+    def save_story_analysis(
+        self, project_id: str, analysis: Any, script_hash: str = ""
+    ) -> datetime:
+        """Persist the whole-story analysis and return when it was saved."""
+        if not self.project_exists(project_id):
+            raise ProjectNotFoundError(project_id)
+
+        saved_at = _utcnow()
+        payload: dict[str, Any] = {
+            "analysis": analysis.model_dump(mode="json"),
+            "project_id": project_id,
+            "script_hash": script_hash,
+            "saved_at": saved_at.isoformat(),
+        }
+        path = self.story_analysis_path(project_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            raise ProjectError(
+                f"Could not save the story analysis: {exc}"
+            ) from exc
+        return saved_at
+
+    def get_story_analysis(
+        self, project_id: str
+    ) -> Optional[tuple[Any, Optional[datetime], str]]:
+        """Load story_analysis.json -> (analysis, saved_at, script_hash)."""
+        path = self.story_analysis_path(project_id)
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        saved_raw = data.get("saved_at")
+        saved_at = (
+            datetime.fromisoformat(saved_raw) if isinstance(saved_raw, str) else None
+        )
+        script_hash = data.get("script_hash")
+        if not isinstance(script_hash, str):
+            script_hash = ""
+        # Lazy import: schemas do not import services.
+        from app.schemas.story_analysis import StoryDirectorAnalysis
+
+        try:
+            analysis = StoryDirectorAnalysis.model_validate(data.get("analysis", data))
+        except Exception:
+            return None
+        return analysis, saved_at, script_hash
+
+    # ------------------------------------------------------------------ #
     # Character cast (AI casting pipeline)
     # ------------------------------------------------------------------ #
     def character_cast_path(self, project_id: str) -> Path:
