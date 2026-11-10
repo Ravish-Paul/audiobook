@@ -8,8 +8,9 @@ assembles the final audiobook.
 Upload script
   → simple creator UI at `/` (upload → narration style → Generate Audiobook):
     the project + title + language are detected automatically
-  → style maps onto the persisted Narration Preferences (preset, intensity,
-    whisper policy, tag density) → persisted per project
+  → mood mode: "Let AI choose" (whole-story analysis picks the profile) or
+    "I'll choose the mood" (one of 12 narration profiles) → persisted as the
+    Narration Preferences (preset, intensity, whisper policy, tag density)
   → Xiaomi MiMo reads the whole story (context + emotional progression)
   → MiMo decides emotion / delivery / voice settings / pauses per paragraph
     AND writes `tts_text` with inline Eleven v4 audio tags ([whispers], …)
@@ -39,6 +40,28 @@ POST generate-audio          → per-utterance voices → FFmpeg → audiobook.m
                                (generation_mode: "multi_voice")
 ```
 
+**Narration Director (12 profiles · auto/manual mood · whole-story analysis):**
+
+```
+POST analyze-story           → MiMo reads the WHOLE script → genre, language,
+                               scene-by-scene mood progression + recommended
+                               profile → story_analysis.json (AUX: no allowance;
+                               a matching saved analysis is reused, {"force": true}
+                               re-runs it)
+  mood mode "auto"           → the recommended profile becomes the global
+                               direction ("Use recommended style" in the UI)
+  mood mode "manual"         → the user's chosen profile WINS — the analysis
+                               stays context only, never a mood stamp
+  three layers reach the plan:
+    1. global profile boundary  (PROFILE_GUIDANCE rendered into the prompt)
+    2. whole-story analysis     (auto mode: scene progression → mood changes)
+    3. per-paragraph direction  (emotion, delivery, tts_text tags, pauses)
+  → NarrationPolicyValidator enforces VARIETY — no one-mood-everywhere
+POST narration-preview/audio → ONE paragraph rendered as narration-preview.mp3
+                               (explicit action only, AUX: no allowance, never
+                               touches the audiobook's files)
+```
+
 **Stage 1 — Audio Analysis Engine (Pyannote diarization + transcription):**
 
 ```
@@ -59,7 +82,35 @@ GET  /projects/{id}/audio-analysis    → normalized word/speaker timeline
 | **Xiaomi MiMo** (`mimo-v2.6-flash`) | Decides *how* to narrate — emotion, intensity, inline audio tags, voice transitions, continuity — **within the user's narration preferences**. Never rewrites the script, never touches ElevenLabs. |
 | **ElevenLabs** (`eleven_v4`) | Only converts text → speech with the numeric settings it is given. It makes **no** narration decisions. |
 | **FFmpeg** | Concatenates the segments, inserts the pauses, and encodes the final MP3 (once) — background music/SFX belong here. |
-| **Narration Preferences** (set via the simple creator at `/`) | The user's contract for how the narrator sounds. Persisted per project, sent to MiMo, enforced after validation by `NarrationPolicyValidator`, embedded in the plan (→ plan hash). Never a frontend-only setting. |
+| **Narration Preferences** (set via the simple creator at `/`) | The user's contract for how the narrator sounds: the **narration profile** (one of 12, or `auto` = AI picks after the whole-story analysis), `acting_intensity`, `whisper_policy`, `tag_density`, `custom_direction`. Persisted per project, sent to MiMo, enforced after validation by `NarrationPolicyValidator`, embedded in the plan (→ plan hash). Never a frontend-only setting. |
+
+## Narration profiles — the 12 moods
+
+The user-facing global direction (`narration_preferences.preset`). Each one
+renders its own `PROFILE_GUIDANCE` into the MiMo system prompt, so the twelve
+**actually plan differently** (asserted by `tests/test_narration_director.py`):
+
+| `preset` id | Label | Character |
+| ----------- | ----- | --------- |
+| `natural` | Natural & Conversational | Clear, conversational and realistic storytelling. |
+| `cinematic` | Cinematic & Immersive | Atmospheric, immersive and dramatically controlled. |
+| `horror` | Horror & Suspense | Gradual tension, unease and suspense. |
+| `romantic` | Romantic & Intimate | Warm, affectionate and emotionally close. |
+| `sensual` | Sensual & Intimate | Close, subtle intimacy only where the scene allows it. |
+| `emotional` | Emotional & Reflective | Sincere, reflective and gently emotional. |
+| `action` | Action & Adventure | Energetic, urgent and sharply focused. |
+| `mystery` | Mystery & Thriller | Measured, curious and quietly tense. |
+| `fantasy` | Fantasy & Epic | Atmospheric, wondrous and epic in scale. |
+| `comedy` | Comedy & Lighthearted | Natural timing with playful lightness. |
+| `professional` | Calm & Professional | Clear, steady and composed. |
+| `children` | Children's Story | Warm, clear and friendly storytelling. |
+| `auto` | AI Automatic | The whole-story analysis picks the profile (mood mode *Let AI choose*). |
+
+Legacy ids `restrained_cinematic`, `expressive`, `dramatic`, `soft`, `smooth`
+stay accepted for older saved preferences/plans but are hidden from the UI
+(`LEGACY_STYLE_ALIASES` maps old localStorage values onto the nearest current
+profile). The profile is a **boundary, not a mood stamp**: neutral narration
+stays neutral and the narrator never inherits a character's emotion or voice.
 
 ## Tech stack
 
@@ -86,8 +137,11 @@ GET  /projects/{id}/audio-analysis    → normalized word/speaker timeline
 | POST | `/projects/{project_id}/upload-script` | Upload a `.txt` script (max 5 MB, UTF-8) |
 | GET | `/projects/{project_id}/narration-preferences` | Saved narration preferences, or the defaults (`saved: false`) |
 | PUT | `/projects/{project_id}/narration-preferences` | Save narration preferences **without** generating a plan |
+| POST | `/projects/{project_id}/analyze-story` | **Whole-story analysis** (genre, language, scene-by-scene mood progression, recommended profile) → `story_analysis.json` · optional body `{"force": true}` · **aux — never consumes an allowance** |
+| GET | `/projects/{project_id}/story-analysis` | The saved analysis (`404` when none exists for the current script) |
 | POST | `/projects/{project_id}/analyze-narration` | **MiMo directs the script → narration_plan.json** (optional body `{"preferences": {...}}`; incl. `tts_text` audio tags) |
 | POST | `/projects/{project_id}/analyze-narration/preview` | Preview ONE paragraph (±1 neighbour as context) — never overwrites the plan |
+| POST | `/projects/{project_id}/narration-preview/audio` | **Render ONE paragraph as `narration-preview.mp3`** (explicit action only; aux — no allowance, writes nothing to the audiobook) |
 | GET | `/projects/{project_id}/narration-plan` | Review the saved plan before generating audio |
 | POST | `/projects/{project_id}/generate-audio` | Generate the audiobook (plan-driven, or legacy single-pass) |
 | GET | `/projects/{project_id}/audio` | Generated audio info + playable URL |
@@ -103,6 +157,8 @@ GET  /projects/{id}/audio-analysis    → normalized word/speaker timeline
 | POST | `/projects/{project_id}/audio-analysis` | Start pyannoteAI diarization + word transcription (async) |
 | GET | `/projects/{project_id}/audio-analysis/status` | Poll local + provider job status (saves results on success) |
 | GET | `/projects/{project_id}/audio-analysis` | Normalized word-level timeline (speakers, words, turns) |
+| GET | `/usage` | The caller's **own** limits: `generation_limit`, `generations_used`, `generations_remaining`, `max_script_characters` |
+| GET | `/media/projects/{project_id}/{path}` | Media files (playback/download of `audiobook.mp3`, previews) |
 
 ## Project structure
 
@@ -112,21 +168,27 @@ audiobook_web/
 │   ├── main.py                    # app, /media + /static mounts, error handlers, startup log
 │   ├── config.py                  # Settings (env + .env driven)
 │   ├── static/                    # Simple audiobook creator UI (no build step, served at /static)
-│   │   ├── index.html             #   upload card, 3 narration styles, one Generate action, result screen
-│   │   ├── app.js                 #   auto project import, style→preferences mapping, generation pipeline
+│   │   ├── index.html             #   upload card, mood-mode switch (AI/manual), 12 profile cards,
+│   │   │                          #   story analysis + narration preview, one Generate action
+│   │   ├── app.js                 #   auto project import, profile→preferences mapping, story analysis,
+│   │   │                          #   narration preview audio, generation pipeline
 │   │   └── style.css
 │   ├── routes/
 │   │   ├── health.py              # GET / (creator UI for browsers, welcome JSON for APIs), GET /health
 │   │   ├── projects.py            # projects + script upload
-│   │   ├── narration.py           # analyze-narration (+ preview), narration-preferences, narration-plan
+│   │   ├── narration.py           # analyze-story, story-analysis, analyze-narration (+ preview),
+│   │   │                          # narration-preview/audio, narration-preferences, narration-plan
 │   │   ├── casting.py             # characters, voice casting, utterance plan
 │   │   ├── audio.py               # generate-audio, audio info
 │   │   ├── audio_analysis.py       # audio-analysis start/status/normalized
+│   │   ├── media.py               # /media/projects/… file serving
+│   │   ├── usage.py               # GET /usage (the caller's own limits)
 │   │   └── elevenlabs.py          # audio-effects catalog proxy
 │   ├── schemas/
 │   │   ├── project.py             # project / script models
 │   │   ├── narration.py           # NarrationPlan, ParagraphPlan (tts_text), VoiceSettings, response models
-│   │   ├── narration_preferences.py # NarrationPreferences + request/response models
+│   │   ├── narration_preferences.py # NarrationPreferences: 12 profiles + auto + legacy ids, guidance
+│   │   ├── story_analysis.py       # whole-story analysis (genre, scenes, recommended profile)
 │   │   ├── casting.py             # characters, voice profiles, candidates, locks
 │   │   ├── multi_voice.py         # Utterance, MultiVoicePlan
 │   │   ├── audio.py               # audio response model
@@ -134,8 +196,11 @@ audiobook_web/
 │   │   └── elevenlabs.py          # audio effects catalog models
 │   └── services/
 │       ├── mimo_client.py         # Xiaomi MiMo (openai SDK) + error mapping
-│       ├── narration_planner.py   # paragraphs → MiMo → validated plan (+ preferences, preview)
-│       ├── narration_policy.py    # NarrationPolicyValidator (enforces the user's preferences)
+│       ├── narration_planner.py   # paragraphs → MiMo → validated plan (+ preferences, preview, preview audio)
+│       ├── narration_policy.py    # NarrationPolicyValidator: preferences + direction/mood VARIETY checks
+│       ├── story_analysis_service.py # whole-story analysis → story_analysis.json (recommended profile)
+│       ├── script_import.py       # one-step import (title/language detection)
+│       ├── script_limits.py       # script length / estimated-duration limits
 │       ├── character_analyzer.py  # story + character discovery (cast)
 │       ├── voice_discovery.py     # /v2/voices, /v1/shared-voices, add voice
 │       ├── voice_matcher.py       # voice scoring/ranking (top-3, threshold)
@@ -157,6 +222,7 @@ audiobook_web/
 │   ├── script.txt
 │   ├── narration_plan.json          # paragraph plan (single-voice flow)
 │   ├── narration_preferences.json   # the user's narration preferences (per project)
+│   ├── story_analysis.json          # whole-story analysis (auto mode + UI panel, script-hash bound)
 │   ├── character_cast.json          # cast + voice profiles + permanent locks
 │   ├── multi_voice_plan.json        # utterance plan (multi-voice flow)
 │   └── audio/
@@ -175,16 +241,35 @@ audiobook_web/
 │   ├── test_api.py                # projects + upload
 │   ├── test_audio.py              # legacy single-pass audio
 │   ├── test_audio_analysis.py     # pyannote Stage 1 (all mocked, 37 tests)
-│   ├── test_audio.py              # legacy single-pass audio
+│   ├── test_beta_security.py      # tokens, sessions, 401-reservation, project isolation
+│   ├── test_casting_ui.py         # casting markup/style + mocked end-to-end workflow
+│   ├── test_composer.py           # real FFmpeg composition
+│   ├── test_delivery_style_compat.py # legacy delivery_style plans still load
 │   ├── test_eleven_v4.py          # v4 tags, continuity, dictionaries, formats
+│   ├── test_frontend.py           # served creator UI contract
+│   ├── test_generation_limits.py  # allowance reservation/join rules
 │   ├── test_mimo_client.py        # MiMo transport + error mapping
+│   ├── test_mimo_director_smoke.py # OPT-IN real-MiMo story analysis (6 cases, plan only)
 │   ├── test_multi_voice.py        # casting, locks, utterances, generation
+│   ├── test_multi_voice_recovery.py # durable plan recovery / fingerprint
 │   ├── test_narration.py          # planning, validation, retries, Hindi
+│   ├── test_narration_director.py # 12 profiles, auto/manual modes, variety policy (26 tests)
 │   ├── test_narration_preferences.py # preferences, policy validator, preview, hashing (28 tests)
+│   ├── test_negation_aware_whisper.py # whisper selection edge cases
 │   ├── test_plan_audio.py         # segments, recovery, metadata, playback
+│   ├── test_quota_audit.py        # cross-process quota ledger audit
+│   ├── test_script_import.py      # from-script import (title/language)
 │   ├── test_tts_text_regression.py # tts_text mandatory + exact-word rules
 │   ├── test_voice_discovery.py    # voice search, pagination, ranking
-│   └── test_composer.py           # real FFmpeg composition
+│   └── js/                        # node behaviour suites vs the real app.js
+│       ├── app_behavior.test.js   #   upload → plan → generate → download
+│       ├── casting.test.js        #   multi-character casting (20 checks)
+│       └── limits.test.js         #   character counting / usage limits
+├── scripts/
+│   ├── real_mimo_plan_smoke.py    # opt-in live smoke runner (real MiMo, plan only)
+│   ├── start_server.bat           # start uvicorn (exactly ONE worker — beta rule)
+│   ├── stop_server.bat            # stop the server
+│   └── show_tokens.bat            # show name:token list from .env (PRIVATE — never share)
 ├── .env.example                   # template (no real credentials)
 ├── requirements.txt
 └── README.md
@@ -208,7 +293,8 @@ notepad .env
 ```
 
 Open <http://127.0.0.1:8000/> for the **audiobook creator** (upload a script,
-pick a style, generate) and <http://127.0.0.1:8000/docs> for Swagger UI.
+choose AI or manual mood mode — 12 narration profiles — then generate) and
+<http://127.0.0.1:8000/docs> for Swagger UI.
 
 ### `.env`
 
@@ -251,14 +337,28 @@ Startup prints status only, never secrets:
 
 1. **`POST /projects`** → `{"name": "My Hindi Audiobook"}` → copy `project_id`.
 2. **`POST /projects/{id}/upload-script`** → choose `sample_script.txt`.
-3. **Narration preferences** (the creator UI at `/` does this for you):
+3. **Narration preferences & direction** (the creator UI at `/` does this for you):
 
    * `PUT /projects/{id}/narration-preferences` → persist the complete object
      (`preset`, `acting_intensity`, `whisper_policy`, `whisper_paragraphs`,
-     `tag_density`, `custom_direction`) without generating anything;
+     `tag_density`, `custom_direction`) without generating anything. `preset`
+     is one of the **twelve narration profiles** (`natural`, `cinematic`,
+     `horror`, `romantic`, `sensual`, `emotional`, `action`, `mystery`,
+     `fantasy`, `comedy`, `professional`, `children`), `auto` (MiMo picks
+     after the story analysis) or a legacy id;
+   * *(optional, mood mode "auto")* `POST /projects/{id}/analyze-story`
+     (body: `{}` or `{"force": true}`) → whole-story analysis saved to
+     `story_analysis.json`: genre, language, dominant mood, **scene-by-scene
+     mood progression** and a `recommended_profile`. A saved analysis that
+     still matches the script is reused; it is **aux — no allowance**.
+     `GET /projects/{id}/story-analysis` reads it back (`404` if none);
    * `POST /projects/{id}/analyze-narration/preview` → direct ONE paragraph
      (its two neighbours are sent as context) before committing to the whole
-     book. A preview **never** overwrites `narration_plan.json`.
+     book. A preview **never** overwrites `narration_plan.json`;
+   * *(optional)* `POST /projects/{id}/narration-preview/audio`
+     (body: `{"paragraph_index": 0}`) → an actual `narration-preview.mp3`
+     sample of that line — explicit action only, **aux: no allowance**, and
+     it never touches the audiobook's files.
 
 4. **`POST /projects/{id}/analyze-narration`** (body: `{"preferences": {...}}`,
    optional) → MiMo reads the whole story and
@@ -361,6 +461,18 @@ removing the script invalidates the analysis and the assignments.
 Character analysis, voice audition, casting build/select/approve and the
 counter (`GET /usage` → `max_script_characters`) are free of allowance.
 
+**The Narration Director in the web UI** (the *Narration style* section):
+a **mood-mode switch** — *Let AI choose based on my story* (default) vs
+*I'll choose the mood*. *Analyze my story* runs `analyze-story` once and
+shows the detected genre, recommended style, story mood, language and the
+**scene progression**, with *Use recommended style* to adopt the
+recommendation; *Preview the narration* renders one representative line via
+`narration-preview/audio` into an inline `<audio>` player (explicit action,
+one at a time, never spends an allowance). In manual mode the **12 profile
+cards** appear and the chosen profile wins; legacy preset ids stored by
+older sessions are mapped to the closest current profile
+(`LEGACY_STYLE_ALIASES`) instead of being displayed.
+
 **Durable plan recovery** — plan existence and validity are decided by the
 SERVER (`multi_voice_plan_state.json` + a canonical fingerprint of the
 stored script, cast and generation-relevant narration preferences), never
@@ -438,6 +550,30 @@ never refund the reservation (conservative provider-failure policy).
   every violation becomes targeted feedback for the next attempt (up to
   `MIMO_MAX_ATTEMPTS`) and a plan is **never** silently accepted — after the
   retries it fails with `502` and nothing is saved.
+* **Narration Director — 12 profiles, auto/manual, three layers** — `preset`
+  is the global profile: the profile's `PROFILE_GUIDANCE` is rendered into
+  the MiMo system prompt as an overall **boundary** (not a per-paragraph
+  stamp), so each of the twelve profiles produces genuinely different
+  planning behaviour; legacy ids stay accepted for old saved preferences but
+  are hidden in the UI. In **auto** mode (`preset: "auto"`) the whole-story
+  analysis (`analyze-story`) supplies the scene-by-scene mood progression
+  and `recommended_profile`, and that profile's guidance is injected into
+  BOTH the single-voice and the multi-voice prompt; in **manual** mode the
+  user's chosen profile WINS and the analysis stays context only. The third
+  layer is the per-paragraph plan itself. Story analysis persists to
+  `story_analysis.json` (script-hash bound, part of the multi-voice plan
+  fingerprint, `FINGERPRINT_VERSION = v2`) and is reused until the script
+  changes.
+* **No one-mood-everywhere (direction variety)** — after Pydantic
+  validation, `NarrationPolicyValidator._check_variety` (skipped for
+  scripts under 4 paragraphs) rejects a plan that stamps one mood on the
+  whole story: a `narration_direction` repeated almost identically in ≥60 %
+  of paragraphs with too little diversity, one **non-neutral emotion**
+  dominating ≥75 % of paragraphs, one profile **mood family** covering
+  ≥60 % of paragraphs, or a single audio tag repeated ≥60 % of paragraphs.
+  Neutral narration must survive; a horror story still gets calm passages.
+  Every violation feeds the same targeted retry loop — never a silent
+  accept.
 * **Preferences are part of the plan hash** — changing them changes
   `plan_hash`, so finished segments built under the old preferences are never
   reused; `generate-audio` additionally refuses with `409` when the stored
@@ -511,18 +647,19 @@ never refund the reservation (conservative provider-failure policy).
 | No character cast / no multi-voice plan yet | `404` |
 | Empty script, script > `ELEVENLABS_MAX_CHARS` | `400` |
 | Narration preferences invalid for this script (whisper index) | `400` |
-| Invalid plan/analysis from MiMo after retries (incl. policy violations) | `502` |
+| Invalid plan/analysis from MiMo after retries (incl. policy + variety violations) | `502` |
+| Story analysis failed after retries / none saved yet (GET) | `502` / `404` |
 | Script changed after analysis (stale plan) | `409` |
 | Narration preferences changed after the plan was generated | `409` |
 | Cast incomplete or not approved (generation) | `409` |
 | Unknown speaker / voice not found / restricted voice | `400` |
 | Missing `MIMO_API_KEY` / `ELEVENLABS_API_KEY` | `500` |
-| MiMo/ElevenLabs rejected the key | `401` |
+| MiMo/ElevenLabs rejected the key | `502` — **never `401`**: `401` is reserved for *this app's* own session/token, so a provider key problem can't log the user out of the UI |
 | Rate limited | `429` |
 | Upstream failure / bad response | `502` |
 | MiMo timeout | `504` |
 | ElevenLabs timeout | `504` |
-| pyannoteAI timeout / rejected key / rate limit | `504` / `401` / `429` |
+| pyannoteAI timeout / rejected key / rate limit | `504` / `502` / `429` (same 401 reservation) |
 | pyannoteAI job failed / normalization produced nothing | `502` |
 | Audio analysis started but not finished yet (GET) | `409` |
 | Missing `PYANNOTE_API_KEY` (analysis start) | `500` |
@@ -536,7 +673,7 @@ never refund the reservation (conservative provider-failure policy).
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-**489 tests passing + 2 opt-in live tests, zero credits spent by default:**
+**583 tests passing + 8 skipped (the opt-in live/smoke tests), zero credits spent by default:**
 
 * `tests/conftest.py` blanks `MIMO_API_KEY` / `ELEVENLABS_API_KEY` /
   `PYANNOTE_API_KEY` and points the base URLs at an unroutable port unless a
@@ -559,6 +696,18 @@ never refund the reservation (conservative provider-failure policy).
   generate-audio (no synthesis, no FFmpeg run), capability-filtered
   `tts_voice_settings` for `eleven_v4`, the anti-overacting prompt rules and
   the served frontend UI;
+* the Narration Director is covered by `tests/test_narration_director.py`
+  (26 tests, all mocked): the twelve profiles + their distinct planning
+  guidance, auto vs manual mode (auto injects the analysed
+  `recommended_profile`, manual keeps the user's profile while the analysis
+  stays context), legacy preset ids, story-analysis persistence/reuse
+  (`story_analysis.json`, script-hash bound, `404` when absent),
+  `{"force": true}`, the `narration-preview/audio` MP3 (no plan overwrite,
+  no allowance), and `_check_variety` — direction repetition, ≥75 % dominant
+  emotion, ≥60 % mood-family/tags, the under-4-paragraph exemption, plus
+  `401`-reservation regressions in `test_beta_security.py` /
+  `test_multi_voice.py` / `test_mimo_client.py` (a provider key failure
+  must map to `502`, never log the user out);
 * ElevenLabs is intercepted with `httpx.MockTransport` to assert the exact
   request body, query params, voice URLs and `request-id` header —
   covering voice discovery + pagination (`/v2/voices`, `/v1/shared-voices`),
@@ -586,19 +735,25 @@ markup/contract of `index.html` + `style.css`, and `node` runs the
 behaviour suites in `tests/js/` against the **real** `app.js` with a fake
 DOM and mocked FastAPI responses — `limits.test.js` (character counting),
 `app_behavior.test.js` (upload → plan → generate → download) and
-`casting.test.js` (15 checks for the multi-character casting option:
+`casting.test.js` (20 checks for the multi-character casting option:
 analysis-once, role display, automatic/manual casting, previews,
 script-replacement invalidation, duplicate guards, zero-allowance
 behaviour, multi-voice generation + honest `generation_mode` check).
 `tests/test_casting_ui.py` adds the markup/style checks, the `/usage`
 script-limit contract and the mocked end-to-end casting workflow.
 
-Opt-in live tests:
+Opt-in live tests (never run by default):
 
 ```powershell
 $env:RUN_MIMO_LIVE_TEST = "1"          # real MiMo analysis (costs tokens)
 $env:RUN_ELEVENLABS_LIVE_TEST = "1"    # real ElevenLabs roundtrip (costs credits)
-.\.venv\Scripts\python.exe -m pytest -q
+
+# Narration Director smoke — 6 real-MiMo story-analysis cases (auto + manual,
+# Hindi-horror + emotional-sad scripts), PLAN ONLY: no ElevenLabs, no pyannote,
+# no FFmpeg, no allowance/quota changes. Needs BOTH flags:
+$env:RUN_MIMO_LIVE_TEST = "1"
+$env:RUN_MIMO_DIRECTOR_SMOKE = "1"
+.\.venv\Scripts\python.exe -m pytest tests\test_mimo_director_smoke.py -q
 ```
 
 ## Configuration reference
@@ -640,7 +795,7 @@ $env:RUN_ELEVENLABS_LIVE_TEST = "1"    # real ElevenLabs roundtrip (costs credit
 | `PYANNOTE_DURATION_TOLERANCE_MS` | `500` | Allowed timestamp overshoot past audio end |
 | `STORAGE_DIR` | `<repo>/storage/projects` | Storage root |
 | `MAX_SCRIPT_SIZE_MB` | `5` | Upload limit |
-| `MAX_SCRIPT_CHARACTERS` | `200000` | Script length limit in Unicode code points (`0` = unlimited; exactly the limit is accepted). The value served to the UI counter comes from `GET /usage`; this repository's `.env` sets `3000`. |
+| `MAX_SCRIPT_CHARACTERS` | `200000` | Script length limit in Unicode code points (`0` = unlimited; exactly the limit is accepted). The value served to the UI counter comes from `GET /usage`; this repository's `.env` sets `200000`. |
 | `MAX_AUDIO_DURATION_MINUTES` | `120` | Cap on the estimated spoken duration (`0` = unlimited) |
 | `SPEECH_CHARS_PER_MINUTE` | `900` | Heuristic used for the duration estimate |
 | `BETA_ACCESS_TOKENS` | *(off)* | `name:token,name2:token2` — per-tester tokens (beta mode) |
@@ -689,10 +844,11 @@ log prints a warning.
   plan validation included) plus audio generation (ElevenLabs segments, audio
   processing, FFmpeg assembly, storage) — shares ONE `generation_id` and
   consumes **exactly one** allowance. The planning call opens the workflow,
-  `generate-audio` joins it. Auxiliary operations (narration preview,
-  character analysis, casting audition, diarization/audio analysis) are
-  **not** audiobook generations: they never reserve or consume the allowance
-  and are never blocked by it — even at `0` remaining. They keep their rate
+  `generate-audio` joins it. Auxiliary operations (**whole-story analysis**,
+  narration paragraph preview, **narration preview audio**, character
+  analysis, casting audition, diarization/audio analysis) are **not**
+  audiobook generations: they never reserve or consume the allowance and
+  are never blocked by it — even at `0` remaining. They keep their rate
   limiting and duplicate-submission protection (`409`).
 * Usage is **persistent and lifetime** per tester: `used` never resets on
   restart or configuration change, and
@@ -742,13 +898,14 @@ log prints a warning.
 
 ## Not implemented yet (by design)
 
-Background music · sound effects beds in the final mix · scene analysis ·
-sound-design director · timeline resolver · FFmpeg multitrack mixing · QA
+Background music · sound effects beds in the final mix · sound-design
+director · timeline resolver · FFmpeg multitrack mixing · QA
 engine · SFX/music/mixing controls (kept out of the simple creator until
 they are ready — a static **audiobook creator** IS served at `/`, see
 `app/static/`) · Celery/Redis
 job queue. (Voice *colouring* via ElevenLabs `audio_effects` IS supported —
-see `ELEVENLABS_AUDIO_EFFECTS`.)
+see `ELEVENLABS_AUDIO_EFFECTS`. And *story* analysis — genre, scene-by-scene
+mood progression, profile recommendation — IS implemented: `analyze-story`.)
 
 ### Stage 1 operational limits (read before production use)
 
