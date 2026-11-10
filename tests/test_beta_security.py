@@ -131,6 +131,29 @@ def _use_fake_audio(monkeypatch: pytest.MonkeyPatch):
 # --------------------------------------------------------------------------- #
 # Unauthenticated access
 # --------------------------------------------------------------------------- #
+def test_401_is_reserved_for_the_callers_own_session() -> None:
+    """Provider auth failures are UPSTREAM errors (502), never 401.
+
+    Regression: while the ElevenLabs credit quota was exhausted, the voice
+    preview (audition) endpoint answered 401 — the frontend treats any 401
+    as "session expired" and redirects to /auth/login, so every voice
+    preview logged the user out over a billing problem.
+    """
+    from app.services.errors import (
+        ElevenLabsAuthError,
+        MiMoAuthError,
+        PyannoteAuthError,
+    )
+
+    for error in (
+        ElevenLabsAuthError("upstream rejected our key"),
+        MiMoAuthError("upstream rejected our key"),
+        PyannoteAuthError("upstream rejected our key"),
+    ):
+        assert error.status_code == 502
+        assert error.status_code != 401
+
+
 def test_unauthenticated_api_requests_get_401(client: TestClient, beta_env) -> None:
     assert client.get("/").status_code == 401
     assert client.get("/health").status_code == 401

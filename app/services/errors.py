@@ -105,9 +105,16 @@ class ElevenLabsConfigError(ElevenLabsError):
 
 
 class ElevenLabsAuthError(ElevenLabsError):
-    """ElevenLabs rejected the API key (401/403)."""
+    """ElevenLabs rejected the API key (upstream 401/403).
 
-    status_code = 401
+    Reported as 502, never 401: in this API a 401 means "YOUR session with
+    this app is invalid". Returning 401 for a server-side provider problem
+    (e.g. an exhausted ElevenLabs credit quota) made the frontend's
+    session-expiry handling redirect the user to the login page — i.e. it
+    logged the user out over a billing issue.
+    """
+
+    status_code = 502
 
 
 class ElevenLabsVoiceError(ElevenLabsError):
@@ -148,9 +155,9 @@ class MiMoConfigError(MiMoError):
 
 
 class MiMoAuthError(MiMoError):
-    """MiMo rejected the API key (401/403)."""
+    """MiMo rejected the API key (upstream 401/403 → 502, see above)."""
 
-    status_code = 401
+    status_code = 502
 
 
 class MiMoRateLimitError(MiMoError):
@@ -487,9 +494,9 @@ class PyannoteConfigError(PyannoteError):
 
 
 class PyannoteAuthError(PyannoteError):
-    """pyannoteAI rejected the API key (401/403)."""
+    """pyannoteAI rejected the API key (upstream 401/403 → 502, see above)."""
 
-    status_code = 401
+    status_code = 502
 
 
 class PyannoteRequestError(PyannoteError):

@@ -77,7 +77,8 @@ async def get_audio_analysis_status(
     deletes job output after 24 hours, so we never rely on it being there.
 
     Errors: 404 unknown project / analysis never started; 504 provider
-    timeout; 429 provider rate limit; 401 bad API key.
+    timeout; 429 provider rate limit; 502 provider rejected our API key
+    (never 401 — 401 means the caller's own session is invalid).
     """
     return await _service().get_status(project_id)
 

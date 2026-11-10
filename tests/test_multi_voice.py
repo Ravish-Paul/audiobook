@@ -95,10 +95,21 @@ VOICE_DETAILS["voice-shared-1"] = account_voice("voice-shared-1")
 class CastingMock(DiscoveryMock):
     """Discovery + voice-detail + shared-import + TTS in one transport."""
 
-    def __init__(self, *, tts_fail_text: Optional[str] = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        tts_fail_text: Optional[str] = None,
+        tts_fail_status: int = 500,
+        tts_fail_detail: str = "simulated upstream failure",
+        tts_fail_always: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.tts_requests: list[dict[str, Any]] = []
         self.tts_fail_text = tts_fail_text
+        self.tts_fail_status = tts_fail_status
+        self.tts_fail_detail = tts_fail_detail
+        self.tts_fail_always = tts_fail_always
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -111,9 +122,13 @@ class CastingMock(DiscoveryMock):
                     "params": dict(request.url.params),
                 }
             )
-            if self.tts_fail_text is not None and body.get("text") == self.tts_fail_text:
+            if self.tts_fail_always or (
+                self.tts_fail_text is not None
+                and body.get("text") == self.tts_fail_text
+            ):
                 return httpx.Response(
-                    500, json={"detail": "simulated upstream failure"},
+                    self.tts_fail_status,
+                    json={"detail": self.tts_fail_detail},
                     request=request,
                 )
             return httpx.Response(
@@ -1000,6 +1015,41 @@ def test_audition_renders_short_line_without_touching_the_cast(
     after = client.get(f"/projects/{project_with_script}/voice-casting").json()
     assert after["narrator"] == before["narrator"]
     assert after["characters"] == before["characters"]
+
+
+def test_provider_401_quota_never_logs_the_user_out(
+    client: TestClient, project_with_script: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ElevenLabs answering 401 (exhausted credit quota) → HTTP 502, not 401.
+
+    Regression: the frontend treats ANY 401 as "session expired" and
+    redirects to /auth/login — so while the ElevenLabs quota was spent,
+    every voice preview logged the user out instead of showing the error.
+    """
+    _analyze(client, monkeypatch, project_with_script)
+    _wire_casting(
+        monkeypatch,
+        _default_mock(
+            tts_fail_always=True,
+            tts_fail_status=401,
+            tts_fail_detail=(
+                "This request exceeds your API key (Dauntless Komodo Dragon) "
+                "quota of 10000. You have 4 credits remaining, while 8 "
+                "credits are required for this request."
+            ),
+        ),
+    )
+    _select_both(client, project_with_script)
+
+    response = client.post(
+        f"/projects/{project_with_script}/voice-casting/audition",
+        json={"speaker_id": "suman", "text": "नमस्ते दोस्तों, कैसे हो?"},
+    )
+
+    assert response.status_code == 502  # NEVER 401 — that logs the UI out
+    detail = response.json()["detail"]
+    assert "ELEVENLABS_API_KEY" in detail
+    assert "quota of 10000" in detail  # the provider's real reason survives
 
 
 def test_audition_text_length_is_capped(

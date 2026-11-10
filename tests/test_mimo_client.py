@@ -119,9 +119,14 @@ def test_timeout_maps_to_504(
     assert "seconds" in str(exc.value)
 
 
-def test_invalid_api_key_maps_to_401(
+def test_invalid_api_key_maps_to_502_not_401(
     with_key: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A provider rejecting OUR key is an upstream failure (502).
+
+    401 is reserved for "your session with this app is invalid" — otherwise
+    the frontend logs the user out over a server-side provider problem.
+    """
     import app.services.mimo_client as module
 
     error = openai_auth_error()
@@ -131,7 +136,7 @@ def test_invalid_api_key_maps_to_401(
 
     with pytest.raises(MiMoAuthError) as exc:
         MiMoClient().complete_json(system=SYSTEM, user=USER)
-    assert exc.value.status_code == 401
+    assert exc.value.status_code == 502
     assert "MIMO_API_KEY" in str(exc.value)
 
 
